@@ -1,0 +1,10 @@
+Sample `/cw route` (debug) output — not the same as `/cw export` waypoint lines; see README **Import/export** for shareable line format.
+
+Sample `/cw route` output
+
+queue=2 carboniteTargets=21 expandedRoute=23 syncPoints=12 totalCost=3360.5 sec explored=172 hasFlyingMount=false simplifyTransit=false useFlightMasters=true
+route 1: maI=2014 (Ironforge) zx=26.6 zy=83.5 wx=3968.838 wy=801.872 edge=start cost=0.0 label=start
+route 2: maI=2014 (Ironforge) zx=72.8 zy=50.2 wx=4041.802 wy=766.810 edge=walk cost=52.9 label=walk-to-node
+route 3: maI=2020 (Stormwind City) zx=66.4 zy=34.1 wx=3670.055 wy=1478.233 edge=tram cost=149.9 label=Tram: Ironforge -> Stormwind City
+route 4: maI=2020 (Stormwind City) zx=18.1 zy=25.8 wx=3502.404 wy=1458.992 edge=walk cost=110.3 label=walk
+...
