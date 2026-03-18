@@ -1,0 +1,9 @@
+## Interface: 30300
+## Title: Custom Waypoints
+## Version: 3.0.0
+## Author: CustomWaypoints
+## Notes: Carbonite-backed custom waypoint queue with transport-aware routing.
+## OptionalDeps: Carbonite
+## SavedVariables: CustomWaypointsDB
+
+CustomWaypoints.lua
