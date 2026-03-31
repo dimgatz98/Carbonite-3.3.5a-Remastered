@@ -256,6 +256,7 @@ STATE = {
     confirmationFrame = nil,
     pendingConfirmationTransport = nil,
     transportManagementFrame = nil,
+    knownLocationsSpecialRegistered = false,
 }
 
 local InvalidateRoute
@@ -1101,6 +1102,15 @@ ShowKnownLocationsFrame = function()
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", function(self) self:StartMoving() end)
     f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:EnableKeyboard(true)
+    f:SetScript("OnShow", function(self) self:EnableKeyboard(true) end)
+    f:SetScript("OnHide", function(self) self:EnableKeyboard(false) end)
+    f:SetScript("OnKeyDown", function(self, key) if key == "ESCAPE" then self:Hide() end end)
+
+    if UISpecialFrames and not STATE.knownLocationsSpecialRegistered then
+        tinsert(UISpecialFrames, "CustomWaypointsKnownLocationsFrame")
+        STATE.knownLocationsSpecialRegistered = true
+    end
 
     local bg = f:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints(f)
@@ -1404,7 +1414,7 @@ EnsureKnownLocationsBinding = function()
 
     STATE.knownLocationsBindingInitialized = true
     local bindingName = "CW_TOGGLE_KNOWN_LOCATIONS"
-    local desired = "CTRL-SHIFT-G"
+    local desired = "SHIFT-G"
 
     if not (SetBinding and SaveBindings and GetCurrentBindingSet and GetBindingKey and GetBindingAction) then
         return
@@ -1419,13 +1429,13 @@ EnsureKnownLocationsBinding = function()
     -- Check if desired key is in use by something else.
     local action = GetBindingAction(desired)
     if action and action ~= "" and action ~= bindingName then
-        dbg("CTRL-SHIFT-G key already in use by " .. tostring(action) .. ", skipping auto-bind for known locations")
+        dbg("SHIFT-G key already in use by " .. tostring(action) .. ", skipping auto-bind for known locations")
         return
     end
 
     SetBinding(desired, bindingName)
     SaveBindings(GetCurrentBindingSet())
-    dbg("known locations binding set to CTRL-SHIFT-G")
+    dbg("known locations binding set to SHIFT-G")
 end
 
 local function EnsureUi()
@@ -2004,6 +2014,235 @@ local function GetPlayerWorldPos()
     }
 end
 
+
+local function ClearPendingTransport()
+    STATE.pendingTransport = nil
+end
+
+local function BeginPendingTransport(reason, fromPos)
+    if not fromPos or not fromPos.maI then return end
+    STATE.pendingTransport = {
+        reason = reason or "unknown",
+        from = CloneWorldPoint(fromPos),
+        wait = 1.0,
+        seenDifferentMap = false,
+        startedAt = GetTime and GetTime() or 0,
+    }
+end
+
+local function ShouldTreatAsTransportTransition(fromPos, toPos, reason)
+    if not fromPos or not toPos then
+        return false, "missing endpoints"
+    end
+
+    if not fromPos.maI or not toPos.maI then
+        return false, "missing map ids"
+    end
+
+    if fromPos.maI == toPos.maI then
+        return false, "same map"
+    end
+
+    -- Check distance to avoid false positives at map borders
+    if fromPos.wx and fromPos.wy and toPos.wx and toPos.wy then
+        local dx = fromPos.wx - toPos.wx
+        local dy = fromPos.wy - toPos.wy
+        local dist = (dx * dx + dy * dy) ^ 0.5
+        if dist < 50 then  -- 50 yards threshold
+            return false, "too close (" .. string.format("%.1f", dist) .. " yards)"
+        end
+    end
+
+    return true, reason or "map changed"
+end
+
+local function ShowTransportConfirmationFrame()
+    if not STATE.pendingConfirmationTransport then return end
+
+    if STATE.confirmationFrame and STATE.confirmationFrame:IsShown() then
+        STATE.confirmationFrame:Hide()
+    end
+
+    local f = CreateFrame("Frame", "CustomWaypointsTransportConfirmationFrame", UIParent)
+    f:SetWidth(400)
+    f:SetHeight(150)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.9)
+
+    local border = f:CreateTexture(nil, "BORDER")
+    border:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
+    border:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 0, 0)
+    border:SetTexture(1, 1, 1, 0.2)
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -10)
+    title:SetText("Confirm Transport Discovery")
+
+    local msg = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    msg:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -40)
+    msg:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -20, 50)
+    msg:SetJustifyH("LEFT")
+    msg:SetJustifyV("TOP")
+    local fromName = STATE.pendingConfirmationTransport.fromPos.mapName or STATE.pendingConfirmationTransport.fromPos.maI
+    local toName = STATE.pendingConfirmationTransport.toPos.mapName or STATE.pendingConfirmationTransport.toPos.maI
+    msg:SetText("Save transport from " .. tostring(fromName) .. " to " .. tostring(toName) .. "?")
+
+    local yesBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    yesBtn:SetWidth(80)
+    yesBtn:SetHeight(22)
+    yesBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 20, 20)
+    yesBtn:SetText("Yes")
+    yesBtn:SetScript("OnClick", function()
+        -- Save the transport
+        local p = STATE.pendingConfirmationTransport
+        EnsureDb()
+        local learned = EnsureTransportDb()
+        local key = tostring(p.fromPos.maI) .. ">" .. tostring(p.toPos.maI)
+
+        for _, edge in ipairs(learned) do
+            if tostring(edge.fromMaI) .. ">" .. tostring(edge.toMaI) == key then
+                edge.uses = (edge.uses or 1) + 1
+                edge.lastSeen = time and time() or nil
+                if not edge.fromWx and p.fromPos.wx then
+                    edge.fromWx = p.fromPos.wx
+                    edge.fromWy = p.fromPos.wy
+                    edge.fromZx = p.fromPos.zx
+                    edge.fromZy = p.fromPos.zy
+                end
+                if not edge.toWx and p.toPos.wx then
+                    edge.toWx = p.toPos.wx
+                    edge.toWy = p.toPos.wy
+                    edge.toZx = p.toPos.zx
+                    edge.toZy = p.toPos.zy
+                end
+                STATE.pendingConfirmationTransport = nil
+                f:Hide()
+                pr("learned transport: " .. tostring(p.fromPos.mapName or p.fromPos.maI) .. " -> " .. tostring(p.toPos.mapName or p.toPos.maI))
+                return
+            end
+        end
+
+        learned[#learned + 1] = {
+            type = "portal",
+            label = tostring(p.fromPos.mapName or p.fromPos.maI) .. " -> " .. tostring(p.toPos.mapName or p.toPos.maI),
+            fromMaI = p.fromPos.maI,
+            toMaI = p.toPos.maI,
+            fromMapName = p.fromPos.mapName,
+            toMapName = p.toPos.mapName,
+            fromWx = p.fromPos.wx,
+            fromWy = p.fromPos.wy,
+            fromZx = p.fromPos.zx,
+            fromZy = p.fromPos.zy,
+            toWx = p.toPos.wx,
+            toWy = p.toPos.wy,
+            toZx = p.toPos.zx,
+            toZy = p.toPos.zy,
+            fromInstance = p.fromPos.instance,
+            fromInstanceType = p.fromPos.instanceType,
+            toInstance = p.toPos.instance,
+            toInstanceType = p.toPos.instanceType,
+            uses = 1,
+            discoveredBy = p.reason or "transport-discovery",
+            lastSeen = time and time() or nil,
+        }
+
+        STATE.pendingConfirmationTransport = nil
+        f:Hide()
+        pr("learned transport: " .. tostring(p.fromPos.mapName or p.fromPos.maI) .. " -> " .. tostring(p.toPos.mapName or p.toPos.maI))
+    end)
+
+    local noBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    noBtn:SetWidth(80)
+    noBtn:SetHeight(22)
+    noBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -20, 20)
+    noBtn:SetText("No")
+    noBtn:SetScript("OnClick", function()
+        STATE.pendingConfirmationTransport = nil
+        f:Hide()
+    end)
+
+    f:SetScript("OnHide", function()
+        STATE.confirmationFrame = nil
+    end)
+
+    if UISpecialFrames then
+        tinsert(UISpecialFrames, "CustomWaypointsTransportConfirmationFrame")
+    end
+
+    STATE.confirmationFrame = f
+    f:Show()
+end
+
+local function RequestLearnedTransportConfirmation(fromPos, toPos, reason)
+    if not fromPos or not toPos then return end
+
+    if STATE.db.transportConfirmationEnabled then
+        STATE.pendingConfirmationTransport = { fromPos = fromPos, toPos = toPos, reason = reason }
+        ShowTransportConfirmationFrame()
+        return
+    end
+
+    -- Direct save
+    EnsureDb()
+    local learned = EnsureTransportDb()
+    local key = tostring(fromPos.maI) .. ">" .. tostring(toPos.maI)
+
+    for _, edge in ipairs(learned) do
+        if tostring(edge.fromMaI) .. ">" .. tostring(edge.toMaI) == key then
+            edge.uses = (edge.uses or 1) + 1
+            edge.lastSeen = time and time() or nil
+            if not edge.fromWx and fromPos.wx then
+                edge.fromWx = fromPos.wx
+                edge.fromWy = fromPos.wy
+                edge.fromZx = fromPos.zx
+                edge.fromZy = fromPos.zy
+            end
+            if not edge.toWx and toPos.wx then
+                edge.toWx = toPos.wx
+                edge.toWy = toPos.wy
+                edge.toZx = toPos.zx
+                edge.toZy = toPos.zy
+            end
+            return
+        end
+    end
+
+    learned[#learned + 1] = {
+        type = "portal",
+        label = tostring(fromPos.mapName or fromPos.maI) .. " -> " .. tostring(toPos.mapName or toPos.maI),
+        fromMaI = fromPos.maI,
+        toMaI = toPos.maI,
+        fromMapName = fromPos.mapName,
+        toMapName = toPos.mapName,
+        fromWx = fromPos.wx,
+        fromWy = fromPos.wy,
+        fromZx = fromPos.zx,
+        fromZy = fromPos.zy,
+        toWx = toPos.wx,
+        toWy = toPos.wy,
+        toZx = toPos.zx,
+        toZy = toPos.zy,
+        fromInstance = fromPos.instance,
+        fromInstanceType = fromPos.instanceType,
+        toInstance = toPos.instance,
+        toInstanceType = toPos.instanceType,
+        uses = 1,
+        discoveredBy = reason or "transport-discovery",
+        lastSeen = time and time() or nil,
+    }
+
+    pr("learned transport: " .. tostring(fromPos.mapName or fromPos.maI) .. " -> " .. tostring(toPos.mapName or toPos.maI))
+end
 
 local function InjectLearnedTransportEdges(addNode, addEdge, graph)
     local learned = EnsureTransportDb()
@@ -4088,3 +4327,4 @@ CW.ImportWaypointsFromText = ImportWaypointsFromText
 
 CW.EnsureUi = EnsureUi
 CW.ToggleUi = ToggleUi
+
