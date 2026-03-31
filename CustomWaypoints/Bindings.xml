@@ -1,0 +1,7 @@
+﻿<Bindings>
+    <Binding name="CW_TOGGLE_KNOWN_LOCATIONS" header="CUSTOMWAYPOINTS">
+        if CustomWaypoints_ToggleKnownLocations then
+            CustomWaypoints_ToggleKnownLocations()
+        end
+    </Binding>
+</Bindings>

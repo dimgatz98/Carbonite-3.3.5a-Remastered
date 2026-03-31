@@ -1,4 +1,4 @@
-## Interface: 30300
+﻿## Interface: 30300
 ## Title: Custom Waypoints
 ## Version: 3.0.0
 ## Author: CustomWaypoints
@@ -6,4 +6,5 @@
 ## OptionalDeps: Carbonite
 ## SavedVariables: CustomWaypointsDB
 
+Bindings.xml
 CustomWaypoints.lua

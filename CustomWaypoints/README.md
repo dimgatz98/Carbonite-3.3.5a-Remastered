@@ -1,4 +1,4 @@
-# CustomWaypoints
+﻿# CustomWaypoints
 
 Small companion addon for **WoW 3.3.5a** that sits **next to** Carbonite: it doesn’t patch Carbonite files, it just talks to the same map APIs.
 
@@ -157,3 +157,32 @@ With **`debug` on**, **`/cw export`** can also dump the **whole block** through 
 ## License
 
 Carbonite’s own license files still apply to Carbonite; this integration layer follows whatever license the remaster repo declares for the fork.
+
+
+## ⚠️ Deep Routing Status (Work in Progress)
+
+Deep routing is currently under active development and **not yet fully reliable**.
+
+While it enables advanced pathfinding across:
+- portals
+- transports (boats, zeppelins, trams)
+- flight masters
+- intercontinental routes
+
+it may still:
+- miss valid optimal routes
+- fall back to cross-continent shortcuts incorrectly
+- behave inconsistently depending on discovered nodes
+
+### Recommendation
+For stable behavior:
+- use **minimal routing mode** (Carbonite-driven)
+
+Use deep routing only for:
+- testing
+- experimentation
+- contributing feedback / debugging
+
+### Notes
+- transport graph and heuristics are still evolving
+- routing correctness is prioritized over completeness at this stage
