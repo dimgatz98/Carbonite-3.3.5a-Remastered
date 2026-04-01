@@ -4,4 +4,9 @@
             CustomWaypoints_ToggleKnownLocations()
         end
     </Binding>
+    <Binding name="CW_SAVE_HERE" header="CUSTOMWAYPOINTS">
+        if CustomWaypoints_SaveHere then
+            CustomWaypoints_SaveHere()
+        end
+    </Binding>
 </Bindings>

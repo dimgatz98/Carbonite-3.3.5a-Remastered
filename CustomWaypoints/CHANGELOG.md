@@ -19,3 +19,12 @@
 - Added case-insensitive search (contains) and instance-only filter in Known Locations UI.
 - Changed keybinding to SHIFT-G for Known Locations.
 - Noted limitation: keybinding may not work reliably due to Carbonite or other addon overrides.
+
+## 2026-04-01
+- Added addon-native `Save Here` keybinding command (`CW_SAVE_HERE`) with best-effort auto-bind preference for Shift+Period when the key is free.
+- `savehere` now marks `lastCaptureTime`, so a freshly saved current-location waypoint is protected by the same post-capture grace window as map-click captures.
+- Hardened Carbonite `ClT1` clear hook: when Carbonite clears near the active waypoint, CW now advances only the first stop if `autoAdvance=true`, and ignores the proximity clear if `autoAdvance=false`, instead of wiping the whole queue.
+- Known Routes can now be edited as full waypoint-line blocks instead of metadata-only edits.
+- Added Known Locations export/import buttons; export writes a portable copy/paste block to the CW log, and import performs union + dedup instead of replacing the existing library.
+- Known-route dedup now compares the full ordered waypoint chain, so multi-waypoint paths no longer collide only by destination.
+- Save captured waypoint / save here now default to a short `wp` label, and Carbonite hover text replaces generic walk wording with the custom label when one exists.

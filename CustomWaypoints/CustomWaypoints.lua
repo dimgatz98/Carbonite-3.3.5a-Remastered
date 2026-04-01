@@ -1,5 +1,4 @@
-﻿
--- ============================================================================
+﻿-- ============================================================================
 -- CustomWaypoints - Phase 5B (patched UI + safer deep fallback)
 --
 -- PURPOSE
@@ -34,6 +33,13 @@ local huge = math.huge
 local lower = string.lower
 local match = string.match
 local band = bit.band
+local ShowWaypointMetadataPopup
+local ShowKnownLocationEditorPopup
+local SaveQueueAsKnownRoute
+local AddLabeledCurrentCursorWaypoint
+local AddCurrentLocationWithMetadataPopup
+local EnsureCarboniteMapButtons
+local routeSelectedBtn
 
 CustomWaypoints = CustomWaypoints or {}
 local CW = CustomWaypoints
@@ -60,6 +66,7 @@ local TRANSIT_EDGE_TYPES = {
 
 BINDING_HEADER_CUSTOMWAYPOINTS = "CustomWaypoints"
 BINDING_NAME_CW_TOGGLE_KNOWN_LOCATIONS = "Toggle Known Locations"
+BINDING_NAME_CW_SAVE_HERE = "Save Here"
 
 local DEFAULTS = {
     destinations = {},
@@ -272,13 +279,21 @@ local ShowKnownLocationsFrame
 local RefreshKnownLocationsFrame
 local RouteToKnownLocation
 local SelectKnownLocation
+local ShowKnownLocationImportPopup
+local ExportKnownLocations
+local ImportKnownLocationsFromText
 local EnsureKnownLocationsBinding
+local EnsureSaveHereBinding
 local InstallUndoRedoBindings
 
 -- Lua 5.1: closures in InstallUndoRedoBindings must capture these locals, not a later global.
 local UndoHistory, RedoHistory
 -- EnsureUi Import button closes over this local (WoW Lua resolves nested refs like globals otherwise).
 local ImportWaypointsFromText
+local SplitLines
+local NormalizeImportLine
+local ParseExportLine
+local SplitExportFields
 
 -- Lexical: must be above InstallUndoRedoBindings if that helper ever calls GetMap at install time.
 local function GetMap()
@@ -299,6 +314,13 @@ local EDGE_COLORS = {
     flying = "|cff88ff88",
 }
 
+local function EscapeForDisplay(text)
+    return tostring(text or ""):gsub("|", "||")
+end
+
+local function UnescapeFromDisplay(text)
+    return tostring(text or ""):gsub("||", "|")
+end
 
 local function NormalizeKnownInstanceName(pt)
     local name = tostring(
@@ -730,6 +752,12 @@ local function LearnedTransportKey(edge)
     return tostring(edge.fromMaI) .. ">" .. tostring(edge.toMaI)
 end
 
+local function HasLearnedTransportCoords(edge)
+    return edge
+        and edge.fromWx and edge.fromWy
+        and edge.toWx and edge.toWy
+end
+
 -- Keep learned transport DB compact and stable across sessions:
 -- for portal discovery we treat same from-map -> to-map as one learned route.
 local function CompactLearnedTransports()
@@ -758,8 +786,31 @@ local function CompactLearnedTransports()
                 dst.toMapName = edge.toMapName or dst.toMapName
                 dst.label = edge.label or dst.label
             end
-            dst.uses = (dst.uses or 1) + (edge.uses or 1)
-            if edge.lastSeen and (not dst.lastSeen or edge.lastSeen > dst.lastSeen) then
+            
+            edge.uses = tonumber(edge.uses) or 1
+            if edge.lastSeen ~= nil then
+                local n = tonumber(edge.lastSeen)
+                if n ~= nil then
+                    edge.lastSeen = n
+                end
+            end
+
+            dst.uses = tonumber(dst.uses) or 1
+            if dst.lastSeen ~= nil then
+                local n = tonumber(dst.lastSeen)
+                if n ~= nil then
+                    dst.lastSeen = n
+                end
+            end
+
+            dst.uses = (tonumber(dst.uses) or 1) + (tonumber(edge.uses) or 1)
+
+            local edgeLastSeenNum = tonumber(edge.lastSeen)
+            local dstLastSeenNum = tonumber(dst.lastSeen)
+
+            if edgeLastSeenNum and (not dstLastSeenNum or edgeLastSeenNum > dstLastSeenNum) then
+                dst.lastSeen = edgeLastSeenNum
+            elseif edge.lastSeen and not dst.lastSeen then
                 dst.lastSeen = edge.lastSeen
             end
         else
@@ -800,6 +851,323 @@ local function CloneWorldPoint(pt)
         zoneText = pt.zoneText,
         subZoneText = pt.subZoneText,
     }
+end
+
+
+local function EscapePortableField(value)
+    return gsub(tostring(value or ""), "|", "/")
+end
+
+local function NormalizeSignatureNumber(value, decimals)
+    value = tonumber(value)
+    if value == nil then return "?" end
+    local fmt = "%0." .. tostring(decimals or 3) .. "f"
+    return format(fmt, value)
+end
+
+-- Build a stable waypoint signature for route/known-location dedup.
+local function BuildWaypointSignature(dest)
+    if not dest then return "nil" end
+    return table.concat({
+        tostring(dest.maI or "?"),
+        NormalizeSignatureNumber(dest.zx, 2),
+        NormalizeSignatureNumber(dest.zy, 2),
+        NormalizeSignatureNumber(dest.wx, 5),
+        NormalizeSignatureNumber(dest.wy, 5),
+    }, "|")
+end
+
+-- Build a stable known-location signature; routes are deduped by the full ordered waypoint chain.
+local function BuildKnownLocationSignature(loc)
+    if not loc then return nil end
+    if loc.kind == "route" and type(loc.routePoints) == "table" and #loc.routePoints > 0 then
+        local parts = {}
+        for i, pt in ipairs(loc.routePoints) do
+            parts[i] = BuildWaypointSignature(pt)
+        end
+        return "route|" .. tostring(#parts) .. "|" .. table.concat(parts, ">")
+    end
+
+    local dest = loc.destination or loc.lastTarget or loc.previousTarget
+    if not dest then return nil end
+    return table.concat({
+        tostring(loc.kind or "known"),
+        tostring(loc.instanceType or ""),
+        BuildWaypointSignature(dest),
+    }, "|")
+end
+
+local function FindDuplicateKnownLocationIndex(candidate, skipIndex)
+    local wanted = BuildKnownLocationSignature(candidate)
+    if not wanted then return nil end
+    for i, loc in ipairs(STATE.db and STATE.db.knownLocations or {}) do
+        if i ~= skipIndex and BuildKnownLocationSignature(loc) == wanted then
+            return i
+        end
+    end
+    return nil
+end
+
+local CloneDestination
+
+-- Clone a waypoint list while preserving ordered route structure.
+local function CloneDestinations(src, seen)
+    if not src then return {} end
+    seen = seen or {}
+
+    if seen[src] then
+        return seen[src]
+    end
+
+    local out = {}
+    seen[src] = out
+
+    for i, dest in ipairs(src) do
+        out[i] = CloneDestination(dest, seen)
+    end
+    return out
+end
+
+-- Clone one destination/route point, including nested routePoints, without recursing forever on cycles.
+CloneDestination = function(dest, seen)
+    if not dest then return nil end
+    seen = seen or {}
+
+    if seen[dest] then
+        return seen[dest]
+    end
+
+    local copy = {}
+    seen[dest] = copy
+
+    for k, v in pairs(dest) do
+        if k == "routePoints" and type(v) == "table" then
+            copy[k] = CloneDestinations(v, seen)
+        else
+            copy[k] = v
+        end
+    end
+    return copy
+end
+
+local function NormalizeKnownLocationAfterEdit(loc)
+    if not loc then return end
+    if loc.kind == "route" then
+        local routePoints = loc.routePoints or {}
+        loc.destination = CloneDestination(routePoints[#routePoints])
+        loc.mapName = routePoints[#routePoints] and routePoints[#routePoints].mapName or nil
+    else
+        local dest = loc.destination or loc.lastTarget or loc.previousTarget
+        if dest then
+            loc.destination = CloneDestination(dest)
+            loc.mapName = dest.mapName or loc.mapName
+        end
+    end
+end
+
+local function SerializeWaypointLine(index, dest)
+    local pname = EscapePortableField(dest.mapName or "?")
+    return format("%d|%d|%s|%.3f|%.3f|%.6f|%.6f|%s|%s|%s",
+        index,
+        dest.maI or -1,
+        pname,
+        dest.zx or -1,
+        dest.zy or -1,
+        dest.wx or -1,
+        dest.wy or -1,
+        dest.ts or "?",
+        EscapePortableField(dest.userName or "?"),
+        EscapePortableField(dest.userLabel or "?")
+    )
+end
+
+local function SerializeRoutePointsBlock(routePoints)
+    local lines = {}
+    for i, dest in ipairs(routePoints or {}) do
+        lines[#lines + 1] = SerializeWaypointLine(i, dest)
+    end
+    return table.concat(lines, "\n")
+end
+
+
+local function ParseRoutePointsBlock(text)
+    local parsed = {}
+    local bad = 0
+    for _, line in ipairs(SplitLines(text or "")) do
+        local dest, why = ParseExportLine(line)
+        if dest then
+            parsed[#parsed + 1] = dest
+        elseif why and why ~= "empty" and why ~= "marker" then
+            bad = bad + 1
+        end
+    end
+    table.sort(parsed, function(a, b)
+        return (a._importOrder or 0) < (b._importOrder or 0)
+    end)
+    for _, dest in ipairs(parsed) do
+        dest._importOrder = nil
+    end
+    return parsed, bad
+end
+
+local function BuildKnownLocationExportHeader(loc)
+    return table.concat({
+        "CWKNOWN",
+        EscapePortableField(loc.kind or "known"),
+        EscapePortableField(loc.name or ""),
+        EscapePortableField(loc.label or ""),
+        EscapePortableField(loc.description or ""),
+        EscapePortableField(loc.instanceType or ""),
+    }, "|")
+end
+
+local function BuildLearnedTransportExportHeader(edge)
+    return table.concat({
+        "CWKNOWN",
+        "transport",
+        EscapePortableField(edge.label or TransportLabel(edge) or ""),
+        "",
+        "",
+        EscapePortableField(edge.toInstanceType or edge.fromInstanceType or ""),
+    }, "|")
+end
+
+local function SerializeLearnedTransportLine(edge)
+    return table.concat({
+        "T",
+        tostring(edge.fromMaI or "?"),
+        EscapePortableField(edge.fromMapName or "?"),
+        NormalizeSignatureNumber(edge.fromZx, 3),
+        NormalizeSignatureNumber(edge.fromZy, 3),
+        NormalizeSignatureNumber(edge.fromWx, 6),
+        NormalizeSignatureNumber(edge.fromWy, 6),
+        tostring(edge.toMaI or "?"),
+        EscapePortableField(edge.toMapName or "?"),
+        NormalizeSignatureNumber(edge.toZx, 3),
+        NormalizeSignatureNumber(edge.toZy, 3),
+        NormalizeSignatureNumber(edge.toWx, 6),
+        NormalizeSignatureNumber(edge.toWy, 6),
+        EscapePortableField(edge.label or ""),
+        tostring(edge.uses or 1),
+        EscapePortableField(edge.lastSeen or "?"),
+        tostring(edge.fromInstance and 1 or 0),
+        EscapePortableField(edge.fromInstanceType or ""),
+        tostring(edge.toInstance and 1 or 0),
+        EscapePortableField(edge.toInstanceType or ""),
+    }, "|")
+end
+
+local function ParseLearnedTransportLine(line)
+    local parts = SplitExportFields(NormalizeImportLine(line))
+    if #parts < 20 or parts[1] ~= "T" then
+        return nil, "bad-transport-line"
+    end
+
+    local fromMaI = tonumber(parts[2])
+    local fromMapName = parts[3] ~= "" and parts[3] ~= "?" and parts[3] or nil
+    local fromZx = tonumber(parts[4])
+    local fromZy = tonumber(parts[5])
+    local fromWx = tonumber(parts[6])
+    local fromWy = tonumber(parts[7])
+
+    local toMaI = tonumber(parts[8])
+    local toMapName = parts[9] ~= "" and parts[9] ~= "?" and parts[9] or nil
+    local toZx = tonumber(parts[10])
+    local toZy = tonumber(parts[11])
+    local toWx = tonumber(parts[12])
+    local toWy = tonumber(parts[13])
+
+    if not fromMaI or not toMaI or not fromWx or not fromWy or not toWx or not toWy then
+        return nil, "bad-transport-coords"
+    end
+
+    return {
+        fromMaI = fromMaI,
+        fromMapName = fromMapName,
+        fromZx = fromZx,
+        fromZy = fromZy,
+        fromWx = fromWx,
+        fromWy = fromWy,
+        toMaI = toMaI,
+        toMapName = toMapName,
+        toZx = toZx,
+        toZy = toZy,
+        toWx = toWx,
+        toWy = toWy,
+        label = parts[14] ~= "" and parts[14] ~= "?" and parts[14] or nil,
+        uses = tonumber(parts[15]) or 1,
+        lastSeen = (parts[16] ~= "" and parts[16] ~= "?") and parts[16] or nil,
+        fromInstance = parts[17] == "1" and true or nil,
+        fromInstanceType = parts[18] ~= "" and parts[18] or nil,
+        toInstance = parts[19] == "1" and true or nil,
+        toInstanceType = parts[20] ~= "" and parts[20] or nil,
+    }, nil
+end
+
+local function ParseKnownLocationHeader(line)
+    line = NormalizeImportLine(line)
+    if not string.match(line or "", "^CWKNOWN|") then
+        return nil
+    end
+
+    local parts = SplitExportFields(line)
+    if parts[1] ~= "CWKNOWN" or #parts < 2 then
+        return nil
+    end
+
+    return {
+        kind = parts[2] ~= "" and parts[2] or "known",
+        name = parts[3] ~= "" and parts[3] or nil,
+        label = parts[4] ~= "" and parts[4] or nil,
+        description = parts[5] ~= "" and parts[5] or nil,
+        instanceType = parts[6] ~= "" and parts[6] or nil,
+    }
+end
+
+local function FinalizeImportedKnownLocation(header, routePoints)
+    routePoints = routePoints or {}
+    if header.kind == "route" then
+        if #routePoints == 0 then return nil, "route-empty" end
+        return {
+            key = "route|" .. tostring(time and time() or GetTime() or math.random(100000, 999999)) .. "|" .. tostring(math.random(1000, 9999)),
+            kind = "route",
+            name = header.name,
+            label = header.label,
+            description = header.description,
+            routePoints = CloneDestinations(routePoints),
+            destination = CloneDestination(routePoints[#routePoints]),
+            mapName = routePoints[#routePoints] and routePoints[#routePoints].mapName or nil,
+            discoveredBy = "import-known-locations",
+        }, nil
+    end
+
+    if #routePoints == 0 then return nil, "point-empty" end
+    local dest = CloneDestination(routePoints[1])
+    return {
+        key = tostring(header.kind or "known") .. "|" .. tostring(time and time() or GetTime() or math.random(100000, 999999)) .. "|" .. tostring(math.random(1000, 9999)),
+        kind = header.kind or "known",
+        name = header.name,
+        label = header.label,
+        description = header.description,
+        destination = dest,
+        mapName = dest and dest.mapName or nil,
+        instance = (header.kind == "instance") and true or nil,
+        instanceType = header.instanceType,
+        discoveredBy = "import-known-locations",
+    }, nil
+end
+
+local function DeduplicateKnownLocationsPreserveOrder(list)
+    local out = {}
+    local seen = {}
+    for _, loc in ipairs(list or {}) do
+        local sig = BuildKnownLocationSignature(loc)
+        if sig and not seen[sig] then
+            seen[sig] = true
+            out[#out + 1] = loc
+        end
+    end
+    return out
 end
 
 -- Save an instance as a known location (routes to entrance only)
@@ -852,12 +1220,6 @@ local function dbg(msg)
     end
 end
 
-local function HasLearnedTransportCoords(edge)
-    return edge
-        and edge.fromWx and edge.fromWy
-        and edge.toWx and edge.toWy
-end
-
 local function CloneKnownLocationDestination(loc)
     if not loc then return nil end
     local pt = loc.destination or loc.lastTarget or loc
@@ -880,24 +1242,46 @@ local function BuildKnownLocationEntries()
     end
 
     for i, loc in ipairs(STATE.db.knownLocations or {}) do
-        local dest = CloneKnownLocationDestination(loc)
-        if dest then
+        if loc and loc.kind == "route" and type(loc.routePoints) == "table" and #loc.routePoints > 0 then
+            local finalDest = CloneDestination(loc.routePoints[#loc.routePoints])
             addEntry({
-                key = tostring(loc.key or ("known|" .. tostring(i))),
-                kind = tostring(loc.kind or "known"),
-                name = tostring(loc.name or dest.mapName or ("Map " .. tostring(dest.maI or "?"))),
-                mapName = dest.mapName,
-                destination = dest,
-                previousTarget = loc.previousTarget or loc.entrance,
-                lastTarget = loc.lastTarget or loc.destination,
-                instance = (loc.instance == true)
-                    or (loc.instanceType and loc.instanceType ~= "" and loc.instanceType ~= "none")
-                    or (dest.instance == true)
-                    or ((dest.instanceType and dest.instanceType ~= "" and dest.instanceType ~= "none") and true or false),
-                instanceType = loc.instanceType or dest.instanceType,
-                sourceType = "knownLocation",
+                key = tostring(loc.key or ("route|" .. tostring(i))),
+                kind = "route",
+                name = tostring(loc.name or ("Route " .. tostring(i))),
+                label = loc.label,
+                description = loc.description,
+                mapName = finalDest and finalDest.mapName or nil,
+                destination = finalDest,
+                routePoints = CloneDestinations(loc.routePoints),
+                previousTarget = loc.routePoints[1],
+                lastTarget = finalDest,
+                instance = false,
+                instanceType = nil,
+                sourceType = "knownRoute",
                 sourceIndex = i,
             })
+        else
+            local dest = CloneKnownLocationDestination(loc)
+            if dest then
+                addEntry({
+                    key = tostring(loc.key or ("known|" .. tostring(i))),
+                    kind = tostring(loc.kind or "known"),
+                    name = tostring(loc.name or dest.mapName or ("Map " .. tostring(dest.maI or "?"))),
+                    label = loc.label,
+                    description = loc.description,
+                    mapName = dest.mapName,
+                    destination = dest,
+                    previousTarget = loc.previousTarget or loc.entrance,
+                    lastTarget = loc.lastTarget or loc.destination,
+                    instance = (loc.instance == true)
+                        or (loc.instanceType and loc.instanceType ~= "" and loc.instanceType ~= "none")
+                        or (dest.instance == true)
+                        or ((dest.instanceType and dest.instanceType ~= "" and dest.instanceType ~= "none") and true or false),
+                    instanceType = loc.instanceType or dest.instanceType,
+                    sourceType = "knownLocation",
+                    sourceIndex = i,
+                })
+            end
         end
     end
 
@@ -969,6 +1353,9 @@ end
 
 local function EntryMatchesFilters(entry, ui)
     if not entry then return false end
+    if ui and ui.routesOnly and not (entry.kind == "route" and entry.sourceType == "knownRoute") then
+        return false
+    end
     if ui and ui.instancesOnly and not entry.instance then
         return false
     end
@@ -976,17 +1363,6 @@ local function EntryMatchesFilters(entry, ui)
         return false
     end
     return true
-end
-
-local function CloneDestinations(src)
-    local out = {}
-    for i, dest in ipairs(src or {}) do
-        out[i] = {}
-        for k, v in pairs(dest) do
-            out[i][k] = v
-        end
-    end
-    return out
 end
 
 local function PushHistorySnapshot(reason)
@@ -1011,15 +1387,24 @@ RouteToKnownLocation = function(index)
         return
     end
 
-    local dest = CloneKnownLocationDestination(entry)
-    if not dest then
-        pr("known location has no destination: " .. tostring(entry.name or index))
-        return
-    end
-
     PushHistorySnapshot("route-known-location")
     wipe(STATE.db.destinations)
-    tinsert(STATE.db.destinations, dest)
+
+    if entry.kind == "route" and type(entry.routePoints) == "table" and #entry.routePoints > 0 then
+        local cloned = CloneDestinations(entry.routePoints)
+        for i = 1, #cloned do
+            tinsert(STATE.db.destinations, cloned[i])
+        end
+        pr(format("loaded known route: %s (%d stop(s))", tostring(entry.name or index), #cloned))
+    else
+        local dest = CloneKnownLocationDestination(entry)
+        if not dest then
+            pr("known location has no destination: " .. tostring(entry.name or index))
+            return
+        end
+        tinsert(STATE.db.destinations, dest)
+        pr(format("routing to known location: %s", tostring(entry.name or dest.mapName or dest.maI)))
+    end
 
     InvalidateRoute("known location selected")
     RefreshUiHeader()
@@ -1027,14 +1412,437 @@ RouteToKnownLocation = function(index)
     if STATE.db.autoSyncToCarbonite then
         SyncQueueToCarbonite()
     end
+end
 
-    pr(format("routing to known location: %s", tostring(entry.name or dest.mapName or dest.maI)))
+SaveQueueAsKnownRoute = function()
+    EnsureDb()
+    if not STATE.db or #(STATE.db.destinations or {}) == 0 then
+        pr("saveroute: queue empty")
+        return
+    end
+
+    ShowWaypointMetadataPopup({
+        title = "Save queue as known route",
+        defaultName = "Route " .. date("%Y-%m-%d %H:%M"),
+        defaultLabel = "route",
+        defaultDescription = "",
+        onSave = function(meta)
+            local key = "route|" .. tostring(time and time() or GetTime() or math.random(100000, 999999))
+            local routePoints = CloneDestinations(STATE.db.destinations)
+            STATE.db.knownLocations = STATE.db.knownLocations or {}
+
+            local candidate = {
+                key = key,
+                kind = "route",
+                name = (meta.name ~= "" and meta.name) or ("Route " .. tostring(#STATE.db.knownLocations + 1)),
+                label = meta.label ~= "" and meta.label or nil,
+                description = meta.description ~= "" and meta.description or nil,
+                routePoints = routePoints,
+                destination = CloneDestination(routePoints[#routePoints]),
+                mapName = routePoints[#routePoints] and routePoints[#routePoints].mapName or nil,
+                discoveredBy = "manual-saveroute",
+            }
+
+            local duplicateIndex = FindDuplicateKnownLocationIndex(candidate)
+            if duplicateIndex then
+                pr("saved known route skipped: duplicate of existing known location #" .. tostring(duplicateIndex))
+                return
+            end
+
+            STATE.db.knownLocations[#STATE.db.knownLocations + 1] = candidate
+
+            pr("saved known route: " .. tostring(meta.name ~= "" and meta.name or key))
+            RefreshKnownLocationsFrame()
+        end
+    })
 end
 
 SelectKnownLocation = function(index)
     if not (STATE.knownLocationsUi and STATE.knownLocationsUi.frame) then return end
     STATE.knownLocationsUi.selectedIndex = index
     RefreshKnownLocationsFrame()
+end
+
+local function DeleteKnownLocationEntry(entry)
+    EnsureDb()
+    if not entry then
+        pr("delete failed: no known location selected")
+        return false
+    end
+
+    if entry.sourceType == "learnedTransport" then
+        local learned = EnsureTransportDb()
+        if not learned[entry.sourceIndex] then
+            pr("delete failed: learned transport not found")
+            return false
+        end
+        table.remove(learned, entry.sourceIndex)
+        InvalidateRoute("deleted learned transport from known locations")
+        pr("deleted learned transport: " .. tostring(entry.name or entry.sourceIndex))
+        return true
+    end
+
+    local known = STATE.db.knownLocations or {}
+    if not entry.sourceIndex or not known[entry.sourceIndex] then
+        pr("delete failed: known location not found")
+        return false
+    end
+
+    local removed = known[entry.sourceIndex]
+    table.remove(known, entry.sourceIndex)
+    InvalidateRoute("deleted known location entry")
+    pr("deleted known location: " .. tostring((removed and removed.name) or entry.name or entry.sourceIndex))
+    return true
+end
+
+local function EnsurePopupEsc(frameName)
+    if UISpecialFrames then
+        local exists = false
+        for _, v in ipairs(UISpecialFrames) do
+            if v == frameName then
+                exists = true
+                break
+            end
+        end
+        if not exists then
+            tinsert(UISpecialFrames, frameName)
+        end
+    end
+end
+
+local function ShowKnownRouteEditorPopup(sourceIndex, loc)
+    local frameName = "CustomWaypointsKnownRouteEditorPopup"
+
+    if STATE.knownRouteEditorPopup and STATE.knownRouteEditorPopup.frame then
+        STATE.knownRouteEditorPopup.frame:Hide()
+    end
+
+    local f = CreateFrame("Frame", frameName, UIParent)
+    f:SetWidth(560)
+    f:SetHeight(420)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(96)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    if f.EnableKeyboard then f:EnableKeyboard(true) end
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:SetScript("OnKeyDown", function(self, key)
+        if key == "ESCAPE" then
+            self:Hide()
+        end
+    end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.92)
+
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\DialogFrame\UI-DialogBox-Background",
+            edgeFile = "Interface\Tooltips\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -12)
+    title:SetText("Edit known route")
+
+    local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -34)
+    subtitle:SetWidth(520)
+    subtitle:SetJustifyH("LEFT")
+    subtitle:SetText("Edit metadata plus all saved waypoint lines for this route. One exported waypoint per line; order is preserved.")
+
+    local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    nameLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -64)
+    nameLabel:SetText("Name")
+
+    local nameBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    nameBox:SetAutoFocus(false)
+    nameBox:SetWidth(330)
+    nameBox:SetHeight(20)
+    nameBox:SetPoint("LEFT", nameLabel, "RIGHT", 10, 0)
+    nameBox:SetText(loc.name or "")
+
+    local labelLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    labelLabel:SetPoint("TOPLEFT", nameLabel, "BOTTOMLEFT", 0, -18)
+    labelLabel:SetText("Label")
+
+    local labelBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    labelBox:SetAutoFocus(false)
+    labelBox:SetWidth(330)
+    labelBox:SetHeight(20)
+    labelBox:SetPoint("LEFT", labelLabel, "RIGHT", 10, 0)
+    labelBox:SetText(loc.label or "")
+
+    local descLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    descLabel:SetPoint("TOPLEFT", labelLabel, "BOTTOMLEFT", 0, -18)
+    descLabel:SetText("Description")
+
+    local descBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    descBox:SetAutoFocus(false)
+    descBox:SetWidth(330)
+    descBox:SetHeight(20)
+    descBox:SetPoint("LEFT", descLabel, "RIGHT", 10, 0)
+    descBox:SetText(loc.description or "")
+
+    local routesLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    routesLabel:SetPoint("TOPLEFT", descLabel, "BOTTOMLEFT", 0, -22)
+    routesLabel:SetText("Route waypoint lines")
+
+    local scroll = CreateFrame("ScrollFrame", frameName .. "Scroll", f, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", routesLabel, "BOTTOMLEFT", 0, -8)
+    scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 48)
+
+    local editor = CreateFrame("EditBox", nil, scroll)
+    editor:SetMultiLine(true)
+    editor:SetAutoFocus(false)
+    editor:SetFontObject(GameFontHighlightSmall)
+    editor:SetWidth(490)
+    editor:SetTextInsets(4, 4, 4, 4)
+    editor:SetJustifyH("LEFT")
+    editor:SetText(SerializeRoutePointsBlock(loc.routePoints or {}))
+    editor:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    editor:SetScript("OnCursorChanged", function(self, x, y, w, h)
+        if scroll.SetHorizontalScroll then scroll:SetHorizontalScroll(0) end
+    end)
+    editor:SetScript("OnTextChanged", function(self)
+        local text = self:GetText() or ""
+        local _, lineCount = string.gsub(text, "", "")
+        local lines = lineCount + 1
+        local _, fontHeight = self:GetFont()
+        fontHeight = fontHeight or 14
+        self:SetHeight(math.max(220, lines * fontHeight + fontHeight * 2))
+        if scroll.UpdateScrollChildRect then
+            scroll:UpdateScrollChildRect()
+        end
+    end)
+    scroll:SetScrollChild(editor)
+    editor:GetScript("OnTextChanged")(editor)
+
+    local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    saveBtn:SetWidth(90)
+    saveBtn:SetHeight(24)
+    saveBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 18, 16)
+    saveBtn:SetText("Save")
+
+    local cancelBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    cancelBtn:SetWidth(90)
+    cancelBtn:SetHeight(24)
+    cancelBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 16)
+    cancelBtn:SetText("Cancel")
+    cancelBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    close:SetScript("OnClick", function() f:Hide() end)
+
+    saveBtn:SetScript("OnClick", function()
+        local parsed, bad = ParseRoutePointsBlock(editor:GetText() or "")
+        if #parsed == 0 then
+            pr("known route edit failed: no valid waypoint lines")
+            return
+        end
+        if bad > 0 then
+            pr("known route edit failed: remove invalid waypoint line(s) first")
+            return
+        end
+
+        local candidate = CloneDestination(loc)
+        candidate.name = (nameBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        candidate.label = (labelBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        candidate.description = descBox:GetText() or ""
+        candidate.routePoints = CloneDestinations(parsed)
+        NormalizeKnownLocationAfterEdit(candidate)
+
+        local duplicateIndex = FindDuplicateKnownLocationIndex(candidate, sourceIndex)
+        if duplicateIndex then
+            pr("known route edit skipped: duplicate of existing known location #" .. tostring(duplicateIndex))
+            return
+        end
+
+        loc.name = candidate.name ~= "" and candidate.name or loc.name
+        loc.label = candidate.label ~= "" and candidate.label or nil
+        loc.description = candidate.description ~= "" and candidate.description or nil
+        loc.routePoints = candidate.routePoints
+        loc.destination = candidate.destination
+        loc.mapName = candidate.mapName
+        RefreshKnownLocationsFrame()
+        pr("updated known route: " .. tostring(loc.name or sourceIndex) .. " (" .. tostring(#loc.routePoints or 0) .. " waypoint(s))")
+        f:Hide()
+    end)
+
+    f:SetScript("OnHide", function(self)
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
+        self:SetParent(nil)
+        if STATE.knownRouteEditorPopup and STATE.knownRouteEditorPopup.frame == self then
+            STATE.knownRouteEditorPopup = nil
+        end
+    end)
+
+    EnsurePopupEsc(frameName)
+    STATE.knownRouteEditorPopup = { frame = f, editor = editor }
+    f:Show()
+    if nameBox.SetFocus then nameBox:SetFocus() end
+end
+
+ShowKnownLocationEditorPopup = function(sourceIndex)
+    EnsureDb()
+    local loc = STATE.db.knownLocations and STATE.db.knownLocations[sourceIndex] or nil
+    if not loc then
+        pr("edit failed: known location not found")
+        return
+    end
+
+    if loc.kind == "route" then
+        ShowKnownRouteEditorPopup(sourceIndex, loc)
+        return
+    end
+
+    ShowWaypointMetadataPopup({
+        title = "Edit known location",
+        defaultName = loc.name or "",
+        defaultLabel = loc.label or "",
+        defaultDescription = loc.description or "",
+        onSave = function(meta)
+            local candidate = CloneDestination(loc)
+            candidate.name = meta.name ~= "" and meta.name or loc.name
+            candidate.label = meta.label ~= "" and meta.label or nil
+            candidate.description = meta.description ~= "" and meta.description or nil
+            NormalizeKnownLocationAfterEdit(candidate)
+
+            local duplicateIndex = FindDuplicateKnownLocationIndex(candidate, sourceIndex)
+            if duplicateIndex then
+                pr("known location edit skipped: duplicate of existing known location #" .. tostring(duplicateIndex))
+                return
+            end
+
+            loc.name = candidate.name
+            loc.label = candidate.label
+            loc.description = candidate.description
+            loc.destination = candidate.destination
+            loc.mapName = candidate.mapName
+            RefreshKnownLocationsFrame()
+            pr("updated known location: " .. tostring(loc.name or sourceIndex))
+        end
+    })
+end
+
+ShowKnownLocationImportPopup = function()
+    local frameName = "CustomWaypointsKnownLocationsImportPopup"
+
+    if STATE.knownLocationImportPopup and STATE.knownLocationImportPopup.frame then
+        STATE.knownLocationImportPopup.frame:Hide()
+    end
+
+    local f = CreateFrame("Frame", frameName, UIParent)
+    f:SetWidth(560)
+    f:SetHeight(360)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(96)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    if f.EnableKeyboard then f:EnableKeyboard(true) end
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:SetScript("OnKeyDown", function(self, key)
+        if key == "ESCAPE" then
+            self:Hide()
+        end
+    end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.92)
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\DialogFrame\UI-DialogBox-Background",
+            edgeFile = "Interface\Tooltips\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -12)
+    title:SetText("Import known locations")
+
+    local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -34)
+    subtitle:SetWidth(520)
+    subtitle:SetJustifyH("LEFT")
+    subtitle:SetText("Paste a Known Locations export block here. Import does union + dedup; existing entries stay in place.")
+
+    local scroll = CreateFrame("ScrollFrame", frameName .. "Scroll", f, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -62)
+    scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 48)
+
+    local editor = CreateFrame("EditBox", nil, scroll)
+    editor:SetMultiLine(true)
+    editor:SetAutoFocus(false)
+    editor:SetFontObject(GameFontHighlightSmall)
+    editor:SetWidth(490)
+    editor:SetTextInsets(4, 4, 4, 4)
+    editor:SetJustifyH("LEFT")
+    editor:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    editor:SetScript("OnTextChanged", function(self)
+        local text = self:GetText() or ""
+        local _, lineCount = string.gsub(text, "", "")
+        local lines = lineCount + 1
+        local _, fontHeight = self:GetFont()
+        fontHeight = fontHeight or 14
+        self:SetHeight(math.max(220, lines * fontHeight + fontHeight * 2))
+        if scroll.UpdateScrollChildRect then
+            scroll:UpdateScrollChildRect()
+        end
+    end)
+    scroll:SetScrollChild(editor)
+    editor:SetText("")
+    editor:GetScript("OnTextChanged")(editor)
+
+    local importBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    importBtn:SetWidth(90)
+    importBtn:SetHeight(24)
+    importBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 18, 16)
+    importBtn:SetText("Import")
+
+    local cancelBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    cancelBtn:SetWidth(90)
+    cancelBtn:SetHeight(24)
+    cancelBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 16)
+    cancelBtn:SetText("Cancel")
+    cancelBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    close:SetScript("OnClick", function() f:Hide() end)
+
+    importBtn:SetScript("OnClick", function()
+        ImportKnownLocationsFromText(editor:GetText() or "")
+        f:Hide()
+    end)
+
+    f:SetScript("OnHide", function(self)
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
+        self:SetParent(nil)
+        if STATE.knownLocationImportPopup and STATE.knownLocationImportPopup.frame == self then
+            STATE.knownLocationImportPopup = nil
+        end
+    end)
+
+    EnsurePopupEsc(frameName)
+    STATE.knownLocationImportPopup = { frame = f, editor = editor }
+    f:Show()
+    if editor.SetFocus then editor:SetFocus() end
 end
 
 RefreshKnownLocationsFrame = function()
@@ -1079,6 +1887,9 @@ RefreshKnownLocationsFrame = function()
         ui.emptyText:SetText("No matching known locations")
         if ui.routeSelectedBtn then
             ui.routeSelectedBtn:Disable()
+        end
+        if ui.deleteSelectedBtn then
+            ui.deleteSelectedBtn:Disable()
         end
         content:SetHeight(40)
         return
@@ -1155,6 +1966,17 @@ RefreshKnownLocationsFrame = function()
                 STATE.knownLocationsUi.frame:Hide()
             end
         end)
+        local editBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        editBtn:SetWidth(54)
+        editBtn:SetHeight(22)
+        editBtn:SetPoint("RIGHT", routeBtn, "LEFT", -6, 0)
+        editBtn:SetText("Edit")
+        editBtn:SetScript("OnClick", function()
+            local chosen = STATE.knownLocationsUi and STATE.knownLocationsUi.visibleEntries and STATE.knownLocationsUi.visibleEntries[i] or nil
+            if chosen and chosen.sourceIndex then
+                ShowKnownLocationEditorPopup(chosen.sourceIndex)
+            end
+        end)
 
         yOffset = yOffset - 44
     end
@@ -1164,6 +1986,14 @@ RefreshKnownLocationsFrame = function()
             ui.routeSelectedBtn:Enable()
         else
             ui.routeSelectedBtn:Disable()
+        end
+    end
+
+    if ui.deleteSelectedBtn then
+        if ui.selectedIndex and visibleEntries[ui.selectedIndex] then
+            ui.deleteSelectedBtn:Enable()
+        else
+            ui.deleteSelectedBtn:Disable()
         end
     end
 
@@ -1257,6 +2087,21 @@ ShowKnownLocationsFrame = function()
     instanceLabel:SetPoint("LEFT", instanceCheck, "RIGHT", 2, 0)
     instanceLabel:SetText("Instances only")
 
+    local routesCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    routesCheck:SetPoint("LEFT", instanceLabel, "RIGHT", 18, 0)
+    routesCheck:SetChecked(false)
+    routesCheck:SetScript("OnClick", function(self)
+        if STATE.knownLocationsUi then
+            STATE.knownLocationsUi.routesOnly = self:GetChecked() and true or false
+            STATE.knownLocationsUi.selectedIndex = nil
+            RefreshKnownLocationsFrame()
+        end
+    end)
+
+    local routesLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    routesLabel:SetPoint("LEFT", routesCheck, "RIGHT", 2, 0)
+    routesLabel:SetText("Routes only")
+
     local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
     close:SetScript("OnClick", function() f:Hide() end)
@@ -1276,11 +2121,66 @@ ShowKnownLocationsFrame = function()
     content:SetSize(500, 1)
     scrollFrame:SetScrollChild(content)
 
+    routeSelectedBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    routeSelectedBtn:SetWidth(120)
+    routeSelectedBtn:SetHeight(22)
+    routeSelectedBtn:SetPoint("LEFT", refreshBtn, "RIGHT", 8, 0)
+    routeSelectedBtn:SetText("Route Selected")
+    routeSelectedBtn:SetScript("OnClick", function()
+        local ui = STATE.knownLocationsUi
+        if not ui or not ui.selectedIndex or not ui.visibleEntries or not ui.visibleEntries[ui.selectedIndex] then
+            return
+        end
+        local chosen = ui.visibleEntries[ui.selectedIndex]
+        local all = BuildKnownLocationEntries()
+        for absoluteIndex = 1, #all do
+            if all[absoluteIndex].key == chosen.key then
+                RouteToKnownLocation(absoluteIndex)
+                break
+            end
+        end
+    end)
+    routeSelectedBtn:Disable()
+
+    local exportBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    exportBtn:SetWidth(70)
+    exportBtn:SetHeight(22)
+    exportBtn:SetPoint("LEFT", routeSelectedBtn, "RIGHT", 8, 0)
+    exportBtn:SetText("Export")
+    exportBtn:SetScript("OnClick", function() ExportKnownLocations() end)
+
+    local importBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    importBtn:SetWidth(70)
+    importBtn:SetHeight(22)
+    importBtn:SetPoint("LEFT", exportBtn, "RIGHT", 8, 0)
+    importBtn:SetText("Import")
+    importBtn:SetScript("OnClick", function() ShowKnownLocationImportPopup() end)
+    
+    local deleteSelectedBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    deleteSelectedBtn:SetWidth(120)
+    deleteSelectedBtn:SetHeight(22)
+    deleteSelectedBtn:SetPoint("LEFT", importBtn, "RIGHT", 8, 0)
+    deleteSelectedBtn:SetText("Delete Selected")
+    deleteSelectedBtn:SetScript("OnClick", function()
+        local ui = STATE.knownLocationsUi
+        if not ui or not ui.selectedIndex or not ui.visibleEntries or not ui.visibleEntries[ui.selectedIndex] then
+            pr("delete failed: no known location selected")
+            return
+        end
+        local chosen = ui.visibleEntries[ui.selectedIndex]
+        if DeleteKnownLocationEntry(chosen) then
+            ui.selectedIndex = nil
+            RefreshKnownLocationsFrame()
+        end
+    end)
+    
     STATE.knownLocationsUi = {
         frame = f,
         content = content,
         scrollFrame = scrollFrame,
         routeSelectedBtn = routeSelectedBtn,
+        exportBtn = exportBtn,
+        importBtn = importBtn,
         searchBox = searchBox,
         instanceCheck = instanceCheck,
         searchText = "",
@@ -1619,35 +2519,49 @@ function CustomWaypoints_ToggleKnownLocations()
     ShowKnownLocationsFrame()
 end
 
+function CustomWaypoints_SaveHere()
+    AddCurrentLocationWithMetadataPopup()
+end
+
+local function TryAutoBindCommand(bindingName, desiredKeys, debugName)
+    if not (SetBinding and SaveBindings and GetCurrentBindingSet and GetBindingKey and GetBindingAction) then
+        return
+    end
+
+    local existing1, existing2 = GetBindingKey(bindingName)
+    if existing1 or existing2 then
+        return
+    end
+
+    for _, desired in ipairs(desiredKeys or {}) do
+        local action = GetBindingAction(desired)
+        if not action or action == "" or action == bindingName then
+            SetBinding(desired, bindingName)
+            SaveBindings(GetCurrentBindingSet())
+            dbg(tostring(debugName or bindingName) .. " binding set to " .. tostring(desired))
+            return
+        end
+    end
+
+    dbg("no free preferred key found for " .. tostring(debugName or bindingName))
+end
+
 EnsureKnownLocationsBinding = function()
     if STATE.knownLocationsBindingInitialized then
         return
     end
 
     STATE.knownLocationsBindingInitialized = true
-    local bindingName = "CW_TOGGLE_KNOWN_LOCATIONS"
-    local desired = "SHIFT-G"
+    TryAutoBindCommand("CW_TOGGLE_KNOWN_LOCATIONS", { "SHIFT-G" }, "known locations")
+end
 
-    if not (SetBinding and SaveBindings and GetCurrentBindingSet and GetBindingKey and GetBindingAction) then
+EnsureSaveHereBinding = function()
+    if STATE.saveHereBindingInitialized then
         return
     end
 
-    -- Already assigned to our command?
-    local existing1, existing2 = GetBindingKey(bindingName)
-    if existing1 or existing2 then
-        return
-    end
-
-    -- Check if desired key is in use by something else.
-    local action = GetBindingAction(desired)
-    if action and action ~= "" and action ~= bindingName then
-        dbg("SHIFT-G key already in use by " .. tostring(action) .. ", skipping auto-bind for known locations")
-        return
-    end
-
-    SetBinding(desired, bindingName)
-    SaveBindings(GetCurrentBindingSet())
-    dbg("known locations binding set to SHIFT-G")
+    STATE.saveHereBindingInitialized = true
+    TryAutoBindCommand("CW_SAVE_HERE", { "SHIFT-R" }, "savehere")
 end
 
 local function EnsureUi()
@@ -1781,6 +2695,13 @@ local function EnsureUi()
     knownBtn:SetText("Known Locations")
     knownBtn:SetScript("OnClick", function() ShowKnownLocationsFrame() end)
 
+    local saveRouteBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    saveRouteBtn:SetWidth(100)
+    saveRouteBtn:SetHeight(22)
+    saveRouteBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 586, -98)
+    saveRouteBtn:SetText("Save Route")
+    saveRouteBtn:SetScript("OnClick", function() SaveQueueAsKnownRoute() end)
+
     local function MakeCheckbox(textLabel, x, y, onClick)
         local cb = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
         cb:SetPoint("TOPLEFT", f, "TOPLEFT", x, y)
@@ -1811,7 +2732,7 @@ local function EnsureUi()
     commands:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -142)
     commands:SetWidth(720)
     commands:SetJustifyH("LEFT")
-    commands:SetText("\n/cw help | ui | tuning | options | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | transportdiscovery | transportconfirmation | managetransports | knownlocations | routeknown <index>")
+    commands:SetText("\n/cw help | ui | tuning | options | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | transportdiscovery | transportconfirmation | managetransports | knownlocations | routeknown <index> | saveroute | savehere")
 
     local importLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     importLabel:SetPoint("TOPLEFT", commands, "BOTTOMLEFT", 0, -6)
@@ -2778,6 +3699,15 @@ local function BuildSyncLabel(idx, pt)
         detail = "Fallback"
     else
         detail = tostring(pt.label or edgeType)
+    end
+
+    local custom = pt.userLabel or pt.userName
+    if custom and custom ~= "" then
+        custom = SanitizeCarboniteLabel(custom)
+        if edgeType == "walk" or edgeType == "walk-to-transport" or edgeType == "transport-to-goal" then
+            return SanitizeCarboniteLabel(format("%d %s - %s", idx, mapName, tostring(custom)))
+        end
+        return SanitizeCarboniteLabel(format("%d %s - %s (%s)", idx, mapName, detail, tostring(custom)))
     end
 
     return SanitizeCarboniteLabel(format("%d %s - %s", idx, mapName, detail))
@@ -3978,13 +4908,83 @@ local function AddCurrentCursorWaypoint()
     end
 end
 
+local function BuildDefaultWaypointName(dest)
+    if not dest then return "" end
+    return tostring(dest.mapName or ("Map " .. tostring(dest.maI or "?")))
+end
+
+AddLabeledCurrentCursorWaypoint = function()
+    local map = GetMap()
+    local dest, why = GetDisplayedCapture(map)
+    if not dest then
+        pr("capture failed: " .. tostring(why))
+        return
+    end
+
+    ShowWaypointMetadataPopup({
+        title = "Save captured waypoint",
+        defaultName = BuildDefaultWaypointName(dest),
+        defaultLabel = "wp",
+        defaultDescription = "",
+        onSave = function(meta)
+            PushHistorySnapshot("add-labeled-waypoint")
+            STATE.lastCaptureTime = GetTime() or 0
+            dest.userName = meta.name ~= "" and meta.name or nil
+            dest.userLabel = meta.label ~= "" and meta.label or nil
+            dest.description = meta.description ~= "" and meta.description or nil
+            tinsert(STATE.db.destinations, dest)
+            InvalidateRoute("labeled waypoint added")
+            RefreshUiHeader()
+            if STATE.db.autoSyncToCarbonite then
+                SyncQueueToCarbonite()
+            end
+            pr("saved labeled waypoint: " .. tostring(dest.userName or dest.mapName or dest.maI))
+        end
+    })
+end
+
+AddCurrentLocationWithMetadataPopup = function()
+    local dest = GetPlayerWorldPos()
+    if not dest then
+        pr("savehere failed: no player position")
+        return
+    end
+
+    if not dest.wx or not dest.wy then
+        pr("savehere failed: current location has no world coordinates")
+        return
+    end
+
+    ShowWaypointMetadataPopup({
+        title = "Save current location as waypoint",
+        defaultName = BuildDefaultWaypointName(dest),
+        defaultLabel = "wp",
+        defaultDescription = "",
+        onSave = function(meta)
+            PushHistorySnapshot("add-current-location-waypoint")
+            STATE.lastCaptureTime = GetTime() or 0
+            dest.userName = meta.name ~= "" and meta.name or nil
+            dest.userLabel = meta.label ~= "" and meta.label or nil
+            dest.description = meta.description ~= "" and meta.description or nil
+            dest.ts = date("%Y-%m-%d %H:%M:%S")
+            tinsert(STATE.db.destinations, dest)
+            InvalidateRoute("current location waypoint added")
+            RefreshUiHeader()
+            if STATE.db.autoSyncToCarbonite then
+                SyncQueueToCarbonite()
+            end
+            pr("saved current-location waypoint: " .. tostring(dest.userName or dest.mapName or dest.maI))
+        end
+    })
+end
+
 local function ListWaypoints()
     if #STATE.db.destinations == 0 then
         pr("queue empty")
         return
     end
     for i, dest in ipairs(STATE.db.destinations) do
-        pr(format("%d) %s | maI=%d | zx=%.1f zy=%.1f | wx=%.3f wy=%.3f | ts=%s",
+        pr(format("%d) %s | maI=%d | zx=%.1f zy=%.1f | wx=%.3f wy=%.3f | name=%s | label=%s | ts=%s",
             i,
             dest.mapName or ("Map " .. tostring(dest.maI)),
             dest.maI or -1,
@@ -3992,6 +4992,8 @@ local function ListWaypoints()
             dest.zy or -1,
             dest.wx or -1,
             dest.wy or -1,
+            tostring(dest.userName or "-"),
+            tostring(dest.userLabel or "-"),
             dest.ts or "?"
         ))
     end
@@ -4008,7 +5010,7 @@ local function ExportWaypoints()
     for i, dest in ipairs(STATE.db.destinations) do
         local pname = dest.mapName or "?"
         pname = gsub(pname, "|", "/")
-        lines[#lines + 1] = format("%d|%d|%s|%.3f|%.3f|%.6f|%.6f|%s",
+        lines[#lines + 1] = format("%d|%d|%s|%.3f|%.3f|%.6f|%.6f|%s|%s|%s",
             i,
             dest.maI or -1,
             pname,
@@ -4016,7 +5018,9 @@ local function ExportWaypoints()
             dest.zy or -1,
             dest.wx or -1,
             dest.wy or -1,
-            dest.ts or "?"
+            dest.ts or "?",
+            gsub(tostring(dest.userName or "?"), "|", "/"),
+            gsub(tostring(dest.userLabel or "?"), "|", "/")
         )
     end
     lines[#lines + 1] = "----- COPY TO HERE -----"
@@ -4029,20 +5033,73 @@ local function ExportWaypoints()
     end
 end
 
-local function SplitExportFields(line)
+-- Export persistent known locations as a portable union/dedup import block.
+ExportKnownLocations = function()
+    EnsureDb()
+    local known = STATE.db.knownLocations or {}
+    local learned = EnsureTransportDb() or {}
+
+    if #known == 0 and #learned == 0 then
+        pr("known locations export: empty")
+        return
+    end
+
+    local lines = {}
+    lines[#lines + 1] = "----- COPY KNOWN LOCATIONS FROM HERE -----"
+
+    for _, loc in ipairs(known) do
+        lines[#lines + 1] = BuildKnownLocationExportHeader(loc)
+        if loc.kind == "route" then
+            for i, pt in ipairs(loc.routePoints or {}) do
+                lines[#lines + 1] = SerializeWaypointLine(i, pt)
+            end
+        else
+            local dest = loc.destination or loc.lastTarget or loc.previousTarget
+            if dest then
+                lines[#lines + 1] = SerializeWaypointLine(1, dest)
+            end
+        end
+    end
+
+    for _, edge in ipairs(learned) do
+        lines[#lines + 1] = BuildLearnedTransportExportHeader(edge)
+        lines[#lines + 1] = SerializeLearnedTransportLine(edge)
+    end
+
+    lines[#lines + 1] = "----- COPY KNOWN LOCATIONS TO HERE -----"
+
+    local blob = table.concat(lines, "\n")
+    local displayBlob = EscapeForDisplay(blob)
+
+    pr("----- COPY KNOWN LOCATIONS FROM HERE -----")
+    AppendUiLogLine(displayBlob)
+    pr("----- COPY KNOWN LOCATIONS TO HERE -----")
+    dbg(displayBlob)
+    pr(format("known locations export: %d known location(s), %d transport(s)", #known, #learned))
+end
+
+SplitExportFields = function(line)
     local parts = {}
-    local i = 1
-    local s = line
+    local s = tostring(line or "")
+    local start = 1
     local len = #s
-    while i <= len do
-        local bar = string.find(s, "|", i, true)
+
+    while true do
+        local bar = string.find(s, "|", start, true)
         if not bar then
-            parts[#parts + 1] = string.sub(s, i)
+            parts[#parts + 1] = string.sub(s, start)
             break
         end
-        parts[#parts + 1] = string.sub(s, i, bar - 1)
-        i = bar + 1
+
+        parts[#parts + 1] = string.sub(s, start, bar - 1)
+        start = bar + 1
+
+        if start > len then
+            parts[#parts + 1] = ""
+            break
+        end
     end
+
     return parts
 end
 
@@ -4093,7 +5150,7 @@ local function ToNumberField(s)
 end
 
 -- Split pasted blob into lines (handles missing final newline, \r, embedded NUL).
-local function SplitLines(raw)
+SplitLines = function(raw)
     local out = {}
     raw = gsub(gsub(gsub(tostring(raw or ""), "\r\n", "\n"), "\r", "\n"), "\0", "")
     raw = StripLeadingBomAndBidi(raw)
@@ -4110,38 +5167,30 @@ local function SplitLines(raw)
     return out
 end
 
-local function NormalizeImportLine(line)
+NormalizeImportLine = function(line)
     if type(line) ~= "string" then return "" end
     line = line:gsub("\r", ""):gsub("^%s+", ""):gsub("%s+$", "")
     line = StripLeadingBomAndBidi(line)
-    -- Fullwidth pipe (U+FF5C) sometimes appears when pasting from rich text
     line = line:gsub("\239\189\156", "|")
     if line == "" then return line end
-    -- Paste from chat log: strip leading |cAARRGGBB ... |r color blocks (repeat).
+
     while true do
         local s, e = string.find(line, "^|c%x%x%x%x%x%x%x%x.-|r%s*", 1)
         if not s then break end
         line = string.sub(line, e + 1):gsub("^%s+", "")
     end
-    -- "CWPhase5B: 1|2020|..." only; never split rows that already look like export (digit|digit|...).
-    if not string.match(line, "^%d+|%d+|") then
+
+    if not string.match(line, "^%d+|%d+|") and not string.match(line, "^CWKNOWN|") and not string.match(line, "^T|") then
         local prefix, rest = string.match(line, "^([^|]-):%s*(.+)$")
         if prefix and rest and not string.find(prefix, "|", 1, true) and #prefix < 64 and #prefix > 0 then
             line = rest:gsub("^%s+", ""):gsub("%s+$", "")
         end
     end
-    line = gsub(line, "%s*|%s*", "|")
-    while true do
-        local prev = line
-        line = gsub(line, "||", "|")
-        if line == prev then break end
-    end
-    line = gsub(line, "^%|+", "")
-    line = gsub(line, "%|+$", "")
+
     return line
 end
 
-local function ParseExportLine(line)
+ParseExportLine = function(line)
     if type(line) ~= "string" then return nil, "notstring" end
     line = line:gsub("\r", ""):gsub("^%s+", ""):gsub("%s+$", "")
     line = StripLeadingBomAndBidi(line)
@@ -4189,21 +5238,39 @@ local function ParseExportLine(line)
     end
 
     local ts = parts[n]
-    local wy = ToNumberField(parts[n - 1])
-    local wx = ToNumberField(parts[n - 2])
-    local zy = ToNumberField(parts[n - 3])
-    local zx = ToNumberField(parts[n - 4])
+    local userLabel, userName, ts
+    local wx, wy, zx, zy
+
+    if n >= 10 then
+        userLabel = parts[n]
+        userName = parts[n - 1]
+        ts = parts[n - 2]
+        wy = ToNumberField(parts[n - 3])
+        wx = ToNumberField(parts[n - 4])
+        zy = ToNumberField(parts[n - 5])
+        zx = ToNumberField(parts[n - 6])
+    else
+        ts = parts[n]
+        wy = ToNumberField(parts[n - 1])
+        wx = ToNumberField(parts[n - 2])
+        zy = ToNumberField(parts[n - 3])
+        zx = ToNumberField(parts[n - 4])
+    end
+
     if zx == nil or zy == nil or wx == nil or wy == nil then
         return nil, format("badposN n=%d zx=%s zy=%s wx=%s wy=%s", n, tostring(zx), tostring(zy), tostring(wx), tostring(wy))
     end
+
+    local nameEnd = (n >= 10) and (n - 7) or (n - 5)
     local nameChunks = {}
-    for p = 3, n - 5 do
+    for p = 3, nameEnd do
         nameChunks[#nameChunks + 1] = parts[p]
     end
     local mapName = table.concat(nameChunks, "|")
     if mapName == "" or mapName == "?" then
         mapName = nil
     end
+
     return {
         _importOrder = idx,
         maI = maI,
@@ -4213,6 +5280,8 @@ local function ParseExportLine(line)
         wx = wx,
         wy = wy,
         ts = (ts and ts ~= "" and ts ~= "?") and ts or nil,
+        userName = (userName and userName ~= "" and userName ~= "?") and userName or nil,
+        userLabel = (userLabel and userLabel ~= "" and userLabel ~= "?") and userLabel or nil,
     }
 end
 
@@ -4273,6 +5342,259 @@ ImportWaypointsFromText = function(text)
     end
 end
 
+local function EnsurePopupEsc(frameName)
+    if UISpecialFrames then
+        local exists = false
+        for _, v in ipairs(UISpecialFrames) do
+            if v == frameName then
+                exists = true
+                break
+            end
+        end
+        if not exists then
+            tinsert(UISpecialFrames, frameName)
+        end
+    end
+end
+
+ImportKnownLocationsFromText = function(text)
+    EnsureDb()
+    if not STATE.db then return end
+    text = gsub(tostring(text or ""), "\0", "")
+    text = UnescapeFromDisplay(text)
+    text = StripLeadingBomAndBidi(text)
+    if text:match("^%s*$") then
+        pr("known locations import: paste a Known Locations export block first")
+        return
+    end
+
+    local imported = {}
+    local importedTransports = {}
+    local pendingHeader = nil
+    local pendingRoutePoints = {}
+    local bad = 0
+
+    local function flushPending()
+        if not pendingHeader then return end
+        if pendingHeader.kind == "transport" then
+            if #pendingRoutePoints == 1 and pendingRoutePoints[1]._transportEdge then
+                importedTransports[#importedTransports + 1] = pendingRoutePoints[1]._transportEdge
+            else
+                bad = bad + 1
+                dbg("known locations import rejected: transport-empty")
+            end
+        else
+            local loc, why = FinalizeImportedKnownLocation(pendingHeader, pendingRoutePoints)
+            if loc then
+                imported[#imported + 1] = loc
+            else
+                bad = bad + 1
+                dbg("known locations import rejected: " .. tostring(why or "?"))
+            end
+        end
+        pendingHeader = nil
+        pendingRoutePoints = {}
+    end
+
+    for _, rawLine in ipairs(SplitLines(text)) do
+        local line = NormalizeImportLine(rawLine)
+        local header = ParseKnownLocationHeader(line)
+        if line == "" or string.find(line, "COPY KNOWN LOCATIONS", 1, true) then
+            -- skip
+        elseif header then
+            flushPending()
+            pendingHeader = header
+        elseif pendingHeader and pendingHeader.kind == "transport" then
+            local edge, why = ParseLearnedTransportLine(line)
+            if edge then
+                pendingRoutePoints[#pendingRoutePoints + 1] = { _transportEdge = edge }
+            elseif why and why ~= "empty" and why ~= "marker" then
+                bad = bad + 1
+            end
+        else
+            local dest, why = ParseExportLine(line)
+            if dest and pendingHeader then
+                dest._importOrder = nil
+                pendingRoutePoints[#pendingRoutePoints + 1] = dest
+            elseif why and why ~= "empty" and why ~= "marker" then
+                bad = bad + 1
+            end
+        end
+    end
+    flushPending()
+
+    if #imported == 0 and #importedTransports == 0 then
+        pr("known locations import: no valid entries found")
+        return
+    end
+
+    local merged = {}
+    for _, loc in ipairs(STATE.db.knownLocations or {}) do
+        merged[#merged + 1] = CloneDestination(loc)
+    end
+    for _, loc in ipairs(imported) do
+        merged[#merged + 1] = loc
+    end
+
+    PushHistorySnapshot("import-known-locations")
+    STATE.db.knownLocations = DeduplicateKnownLocationsPreserveOrder(merged)
+
+    local learned = EnsureTransportDb()
+    for _, edge in ipairs(importedTransports) do
+        learned[#learned + 1] = edge
+    end
+    CompactLearnedTransports()
+
+    RefreshKnownLocationsFrame()
+    InvalidateRoute("known locations import")
+
+    if bad > 0 then
+        pr(format("known locations import: merged %d known location(s) and %d transport(s), skipped %d bad line(s)", #imported, #importedTransports, bad))
+    else
+        pr(format("known locations import: merged %d known location(s) and %d transport(s)", #imported, #importedTransports))
+    end
+end
+
+ShowWaypointMetadataPopup = function(opts)
+    opts = opts or {}
+    local frameName = "CustomWaypointsWaypointMetadataPopup"
+
+    if STATE.waypointMetadataPopup and STATE.waypointMetadataPopup.frame then
+        STATE.waypointMetadataPopup.frame:Hide()
+    end
+
+    local f = CreateFrame("Frame", frameName, UIParent)
+    f:SetWidth(430)
+    f:SetHeight(245)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(95)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    if f.EnableKeyboard then f:EnableKeyboard(true) end
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:SetScript("OnKeyDown", function(self, key)
+        if key == "ESCAPE" then
+            self:Hide()
+        end
+    end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.9)
+
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -12)
+    title:SetText(opts.title or "Waypoint details")
+
+    local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    nameLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -42)
+    nameLabel:SetText("Name")
+
+    local nameBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    nameBox:SetAutoFocus(false)
+    nameBox:SetWidth(250)
+    nameBox:SetHeight(20)
+    nameBox:SetPoint("LEFT", nameLabel, "RIGHT", 10, 0)
+    nameBox:SetText(opts.defaultName or "")
+
+    local labelLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    labelLabel:SetPoint("TOPLEFT", nameLabel, "BOTTOMLEFT", 0, -22)
+    labelLabel:SetText("Label")
+
+    local labelBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    labelBox:SetAutoFocus(false)
+    labelBox:SetWidth(250)
+    labelBox:SetHeight(20)
+    labelBox:SetPoint("LEFT", labelLabel, "RIGHT", 10, 0)
+    labelBox:SetText(opts.defaultLabel or "")
+
+    local descLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    descLabel:SetPoint("TOPLEFT", labelLabel, "BOTTOMLEFT", 0, -22)
+    descLabel:SetText("Description")
+
+    local descBox = CreateFrame("EditBox", nil, f)
+    descBox:SetMultiLine(true)
+    descBox:SetAutoFocus(false)
+    descBox:SetWidth(360)
+    descBox:SetHeight(70)
+    descBox:SetPoint("TOPLEFT", descLabel, "BOTTOMLEFT", 0, -8)
+    descBox:SetFontObject(GameFontHighlightSmall)
+    descBox:SetTextInsets(4, 4, 4, 4)
+    descBox:SetJustifyH("LEFT")
+    descBox:SetText(opts.defaultDescription or "")
+    if descBox.EnableKeyboard then descBox:EnableKeyboard(true) end
+    descBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+    local descBg = descBox:CreateTexture(nil, "BACKGROUND")
+    descBg:SetTexture(0.08, 0.08, 0.1, 0.9)
+    descBg:SetPoint("TOPLEFT", -3, 3)
+    descBg:SetPoint("BOTTOMRIGHT", 3, -3)
+
+    local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    saveBtn:SetWidth(90)
+    saveBtn:SetHeight(24)
+    saveBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 18, 18)
+    saveBtn:SetText("Save")
+
+    local cancelBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    cancelBtn:SetWidth(90)
+    cancelBtn:SetHeight(24)
+    cancelBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 18)
+    cancelBtn:SetText("Cancel")
+    cancelBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    close:SetScript("OnClick", function() f:Hide() end)
+
+    saveBtn:SetScript("OnClick", function()
+        local payload = {
+            name = (nameBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", ""),
+            label = (labelBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", ""),
+            description = descBox:GetText() or "",
+        }
+        if opts.onSave then
+            opts.onSave(payload)
+        end
+        f:Hide()
+    end)
+
+    f:SetScript("OnHide", function(self)
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
+        self:SetParent(nil)
+        if STATE.waypointMetadataPopup and STATE.waypointMetadataPopup.frame == self then
+            STATE.waypointMetadataPopup = nil
+        end
+    end)
+
+    EnsurePopupEsc(frameName)
+
+    STATE.waypointMetadataPopup = {
+        frame = f,
+        nameBox = nameBox,
+        labelBox = labelBox,
+        descBox = descBox,
+    }
+
+    f:Show()
+    if nameBox.SetFocus then
+        nameBox:SetFocus()
+    end
+end
+
 local function InternalClearWaypoints(silent)
     PushHistorySnapshot("clear-waypoints")
     wipe(STATE.db.destinations)
@@ -4301,6 +5623,24 @@ end
 -- Seconds to wait after adding a waypoint before AutoAdvance may remove #1 (avoids "vanished" right after click).
 local GRACE_AFTER_CAPTURE_SEC = 4
 
+local function GetReachedFirstWaypointDistanceYards()
+    if not STATE.db or #STATE.db.destinations == 0 then return nil end
+
+    local player = GetPlayerWorldPos()
+    if not player then return nil end
+
+    local first = STATE.db.destinations[1]
+    if not first or not first.wx or not first.wy then return nil end
+    if player.maI ~= first.maI then return nil end
+
+    local yards = WorldToYards(Dist(player.wx, player.wy, first.wx, first.wy))
+    if yards <= (STATE.db.reachDistanceYards or 10) then
+        return yards
+    end
+
+    return nil
+end
+
 local function PulseAutoAdvance()
     if not STATE.db.autoAdvance then return end
     if #STATE.db.destinations == 0 then return end
@@ -4313,15 +5653,8 @@ local function PulseAutoAdvance()
         return
     end
 
-    local player = GetPlayerWorldPos()
-    if not player then return end
-
-    local first = STATE.db.destinations[1]
-    if not first or not first.wx or not first.wy then return end
-    if player.maI ~= first.maI then return end
-
-    local yards = WorldToYards(Dist(player.wx, player.wy, first.wx, first.wy))
-    if yards <= (STATE.db.reachDistanceYards or 10) then
+    local yards = GetReachedFirstWaypointDistanceYards()
+    if yards then
         RemoveFirstWaypoint(format("%.1f yards", yards))
     end
 end
@@ -4388,7 +5721,7 @@ local function RouteSummary()
             pt.wy or -1,
             ColorizeEdgeName(pt.edgeType, tostring(pt.edgeType)),
             pt.cost or -1,
-            tostring(pt.label)
+            tostring(pt.userName or pt.userLabel or pt.label)
         ))
     end
 end
@@ -4403,6 +5736,24 @@ local function GraphSummary()
     dbg(format("graph nodes=%d edges=%d transportLinks=%d", graph.nodeCount or 0, graph.edgeCount or 0, #(graph.links or {})))
 end
 
+EnsureCarboniteMapButtons = function()
+    if STATE.mapSaveRouteButton then return end
+    local map = GetMap()
+    if not map or not map.Frm then return end
+
+    local b = CreateFrame("Button", "CWPhase5BSaveRouteMapButton", map.Frm, "UIPanelButtonTemplate")
+    b:SetWidth(88)
+    b:SetHeight(20)
+    b:SetPoint("BOTTOMRIGHT", map.Frm, "BOTTOMRIGHT", 0, 25)
+    b:SetText("Save Route")
+    b:SetFrameStrata("DIALOG")
+    b:SetScript("OnClick", function()
+        SaveQueueAsKnownRoute()
+    end)
+
+    STATE.mapSaveRouteButton = b
+end
+
 local function HookMapClicks()
     if STATE.hookInstalled then return end
     local map = GetMap()
@@ -4411,10 +5762,13 @@ local function HookMapClicks()
     map.Frm:HookScript("OnMouseDown", function(_, button)
         if STATE.syncing then return end
 
-        local primary = (button == (STATE.db.bindingButton or "LeftButton") and IsModifierDown(STATE.db.bindingModifier or "SHIFT"))
+        local labeled = (button == "LeftButton" and IsShiftKeyDown() and IsControlKeyDown())
+        local primary = (button == (STATE.db.bindingButton or "LeftButton") and IsModifierDown(STATE.db.bindingModifier or "SHIFT") and not IsControlKeyDown())
         local fallback = (button == (STATE.db.fallbackButton or "RightButton") and IsModifierDown(STATE.db.fallbackModifier or "CTRL"))
 
-        if primary or fallback then
+        if labeled then
+            AddLabeledCurrentCursorWaypoint()
+        elseif primary or fallback then
             AddCurrentCursorWaypoint()
         end
     end)
@@ -4438,10 +5792,22 @@ local function HookCarboniteClear()
             return
         end
 
+        if not STATE.db.autoAdvance then
+            dbg("ignored Carbonite clear because autoAdvance=false")
+            return
+        end
+
+        local reachedYards = GetReachedFirstWaypointDistanceYards()
+        if reachedYards then
+            dbg(format("Carbonite clear near reached waypoint; advancing queue instead of clearing all (%.1f yards)", reachedYards))
+            RemoveFirstWaypoint(format("Carbonite clear %.1f yards", reachedYards))
+            return
+        end
+
         wipe(STATE.db.destinations)
         InvalidateRoute("Carbonite clear")
         pr("queue cleared (Carbonite Goto / targets were cleared in-game)")
-        dbg("queue cleared because Carbonite ClT1 ran (user or addon cleared targets)")
+        dbg("queue cleared because Carbonite ClT1 ran away from the active waypoint with autoAdvance=true")
     end)
 
     STATE.clearHookInstalled = true
@@ -4459,6 +5825,10 @@ SlashHandler = function(msg)
         ToggleUi()
     elseif msg == "tuning" or msg == "routing" or msg == "routingtuning" then
         ToggleRoutingTuningUi()
+    elseif msg == "saveroute" then
+        SaveQueueAsKnownRoute()
+    elseif msg == "savehere" then
+        AddCurrentLocationWithMetadataPopup()
     elseif msg == "options" or msg == "config" then
         EnsureInterfaceOptionsPanel()
         if STATE.interfacePanel then
@@ -4619,8 +5989,10 @@ local function OnEvent(_, event)
         InstallCarboniteSclGuard()
         InstallUndoRedoBindings()
         EnsureKnownLocationsBinding()
+        EnsureSaveHereBinding()
         EnsureInterfaceOptionsPanel()
         ScheduleLoginQueueSyncIfNeeded()
+        EnsureCarboniteMapButtons()
         dbg("loaded (Phase 5B patched: UI/options/bindings + safer deep fallback + SCL guard)")
     elseif event == "PLAYER_ENTERING_WORLD" then
         EnsureDb()
@@ -4630,8 +6002,10 @@ local function OnEvent(_, event)
         InstallCarboniteSclGuard()
         InstallUndoRedoBindings()
         EnsureKnownLocationsBinding()
+        EnsureSaveHereBinding()
         EnsureInterfaceOptionsPanel()
         ScheduleLoginQueueSyncIfNeeded()
+        EnsureCarboniteMapButtons()
         if STATE.lastStablePlayerPos then
             BeginPendingTransport("PLAYER_ENTERING_WORLD", STATE.lastStablePlayerPos)
         end
@@ -4644,6 +6018,7 @@ local function OnEvent(_, event)
 end
 
 local function OnUpdate(_, elapsed)
+    EnsureCarboniteMapButtons()
     TryPendingLoginQueueSync()
     PulseTransportDiscovery(elapsed)
     PulseAutoAdvance()
