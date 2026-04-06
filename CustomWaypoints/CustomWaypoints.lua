@@ -3982,9 +3982,33 @@ local function InstallUndoRedoBindings()
         end)
         b:Hide()
     end
+    if not _G.CWPhase5BClearHotkeyButton then
+        local b = CreateFrame("Button", "CWPhase5BClearHotkeyButton", UIParent)
+        b:SetScript("OnClick", function()
+            EnsureDb()
+            local d = STATE.db and STATE.db.destinations or nil
+            if not d or #d == 0 then
+                pr("clear: queue already empty")
+                return
+            end
+
+            PushHistorySnapshot("hotkey-clear")
+            wipe(d)
+            InvalidateRoute("hotkey-clear")
+            if STATE.db.autoSyncToCarbonite then
+                SyncQueueToCarbonite()
+            else
+                ClearCarboniteTargets()
+            end
+            pr("queue cleared (Ctrl+Shift+C)")
+            RefreshUiHeader()
+        end)
+        b:Hide()
+    end
 
     local undoClick = "CLICK CWPhase5BUndoHotkeyButton:LeftButton"
     local redoClick = "CLICK CWPhase5BRedoHotkeyButton:LeftButton"
+    local clearClick = "CLICK CWPhase5BClearHotkeyButton:LeftButton"
     local bindChanged = false
 
     local function CanAssignKey(key, boundTo)
@@ -4009,6 +4033,16 @@ local function InstallUndoRedoBindings()
             bindChanged = true
         elseif SetBinding then
             SetBinding("CTRL-SHIFT-Y", redoClick)
+            bindChanged = true
+        end
+    end
+
+    if CanAssignKey("CTRL-SHIFT-C", clearClick) then
+        if SetBindingClick then
+            SetBindingClick("CTRL-SHIFT-C", "CWPhase5BClearHotkeyButton", "LeftButton")
+            bindChanged = true
+        elseif SetBinding then
+            SetBinding("CTRL-SHIFT-C", clearClick)
             bindChanged = true
         end
     end
