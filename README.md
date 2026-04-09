@@ -89,13 +89,8 @@ This repo bundles a **Wrath-era (3.3.5a)** Carbonite tree with **CustomWaypoints
 
 ### Minimal Mode (Stable)
 - Uses Carbonite routing
-- Reliable and predictable
-- Recommended for normal use
 
 ### Deep Mode (Experimental)
 - Custom graph-based routing (Dijkstra-style)
 - Uses learned transports and extended graph
-- Not guaranteed to find optimal or correct routes yet
 - May produce unexpected fallbacks
-
-> Deep mode is under active development and should be treated as experimental.

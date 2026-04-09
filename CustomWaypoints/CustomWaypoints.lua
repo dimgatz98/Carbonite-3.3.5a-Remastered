@@ -44,6 +44,7 @@ local routeSelectedBtn
 local BuildKnownLocationSignature
 local FindDuplicateKnownLocationIndex
 local GetPlayerWorldPos
+local NormalizeSignatureNumber
 
 CustomWaypoints = CustomWaypoints or {}
 local CW = CustomWaypoints
@@ -58,6 +59,7 @@ local STRAIGHT_EDGE_TYPES = {
     portal = true,
     transport = true,
     taxi = true,
+    flight_master = true,
     route = true,
 }
 
@@ -67,6 +69,7 @@ local TRANSIT_EDGE_TYPES = {
     tram = true,
     portal = true,
     taxi = true,
+    flight_master = true,
     route = true,
 }
 
@@ -88,7 +91,7 @@ local DEFAULTS = {
     useIntercontinentalRouting = true,
     useFlightMasters = true,
     hasFlyingMount = false,
-    simplifyTransitWaypoints = true,
+    simplifyTransitWaypoints = false,
     showUi = true,
     uiScale = 1,
     transportDiscoveryEnabled = true,
@@ -111,6 +114,9 @@ local ROUTING_TUNING_DEFAULTS = {
     boatBonus = 35,
     zeppelinBonus = 35,
     taxiBonus = 70,
+    flightMasterBoardingSeconds = 20,
+    flightMasterSpeedYardsPerSecond = 15,
+    flightMasterLandingSeconds = 12,
     -- Maximum post-portal walk distance without switching to taxi
     maxPostPortalWalkWithoutTaxi = 700,
 }
@@ -286,6 +292,98 @@ local function GetRoutingTuning()
     return out
 end
 
+local function GetEdgeTransportKind(edge)
+    if not edge then return nil end
+    local kind = edge.transportKind or edge.kind or edge.type
+    if kind == "taxi" then
+        return "flight_master"
+    end
+    if kind and kind ~= "" then
+        return kind
+    end
+    return nil
+end
+
+local function IsFlightMasterKind(kind)
+    return kind == "flight_master" or kind == "taxi"
+end
+
+local function IsBidirectionalTransportRecord(edge)
+    if not edge then return false end
+    if edge.bidirectional ~= nil then
+        return edge.bidirectional == true
+    end
+    return IsFlightMasterKind(GetEdgeTransportKind(edge))
+end
+
+local function CanonicalTransportKind(kind)
+    if IsFlightMasterKind(kind) then
+        return "flight_master"
+    end
+    if kind == nil or kind == "" then
+        return "transport"
+    end
+    return kind
+end
+
+local function NormalizeTransportRecord(edge)
+    if type(edge) ~= "table" then return edge end
+    edge.transportKind = CanonicalTransportKind(GetEdgeTransportKind(edge))
+    if IsFlightMasterKind(edge.transportKind) then
+        edge.transportKind = "flight_master"
+        edge.bidirectional = true
+    elseif edge.bidirectional == nil then
+        edge.bidirectional = false
+    else
+        edge.bidirectional = edge.bidirectional and true or false
+    end
+    return edge
+end
+
+local function CloneTransportEdgeWithEndpoints(edge)
+    if not edge then return nil end
+    local copy = {}
+    for k, v in pairs(edge) do copy[k] = v end
+    return NormalizeTransportRecord(copy)
+end
+
+local function BuildTransportRecordKey(edge)
+    if not edge or not edge.fromMaI or not edge.toMaI then return nil end
+    edge = NormalizeTransportRecord(edge)
+    local kind = CanonicalTransportKind(edge.transportKind)
+    local a = table.concat({
+        tostring(edge.fromMaI or "?"),
+        NormalizeSignatureNumber(edge.fromWx, 5),
+        NormalizeSignatureNumber(edge.fromWy, 5),
+        tostring(edge.toMaI or "?"),
+        NormalizeSignatureNumber(edge.toWx, 5),
+        NormalizeSignatureNumber(edge.toWy, 5),
+    }, "|")
+    if IsBidirectionalTransportRecord(edge) then
+        local b = table.concat({
+            tostring(edge.toMaI or "?"),
+            NormalizeSignatureNumber(edge.toWx, 5),
+            NormalizeSignatureNumber(edge.toWy, 5),
+            tostring(edge.fromMaI or "?"),
+            NormalizeSignatureNumber(edge.fromWx, 5),
+            NormalizeSignatureNumber(edge.fromWy, 5),
+        }, "|")
+        if b < a then a = b end
+    end
+    return kind .. "|" .. a .. "|b=" .. tostring(IsBidirectionalTransportRecord(edge) and 1 or 0)
+end
+
+local function InferStoredTransportKind(loc)
+    if not loc then return nil end
+    if loc.transportKind and loc.transportKind ~= "" then
+        return CanonicalTransportKind(loc.transportKind)
+    end
+    if loc.kind == "transport" and loc.label and string.find(lower(tostring(loc.label)), "flight master", 1, true) then
+        return "flight_master"
+    end
+    return nil
+end
+
 local function TuningBonusToSeconds(bonus, scale, maxReduction)
     bonus = tonumber(bonus) or 0
     if bonus < 0 then bonus = 0 end
@@ -298,14 +396,18 @@ end
 
 local function GetTransportPreferenceReductionSeconds(transportType, learnedHop)
     local tuning = GetRoutingTuning()
+    transportType = CanonicalTransportKind(transportType)
 
     if learnedHop then
-        -- Learned portals are still portal paths: when portal bonus is zero,
-        -- do not keep hidden learned-portal preference active.
-        if (tuning.portalBonus or 0) <= 0 then
-            return 0
+        if transportType == "portal" then
+            -- Learned portals are still portal paths: when portal bonus is zero,
+            -- do not keep hidden learned-portal preference active.
+            if (tuning.portalBonus or 0) <= 0 then
+                return 0
+            end
+            return TuningBonusToSeconds(tuning.learnedPortalBonus, 0.15, 18)
         end
-        return TuningBonusToSeconds(tuning.learnedPortalBonus, 0.15, 18)
+        return 0
     end
 
     if transportType == "portal" then
@@ -316,7 +418,7 @@ local function GetTransportPreferenceReductionSeconds(transportType, learnedHop)
         return TuningBonusToSeconds(tuning.boatBonus, 0.10, 14)
     elseif transportType == "zeppelin" then
         return TuningBonusToSeconds(tuning.zeppelinBonus, 0.10, 14)
-    elseif transportType == "taxi" then
+    elseif transportType == "flight_master" then
         return TuningBonusToSeconds(tuning.taxiBonus, 0.12, 18)
     end
 
@@ -372,27 +474,13 @@ local function GetAttachCandidateScoreSeconds(rawWalkSeconds, candidate, isStart
     local tuning = GetRoutingTuning()
     local score = tonumber(rawWalkSeconds) or huge
 
-    if isStart and candidate.learnedS then
-        score = score - TuningBonusToSeconds(tuning.learnedPortalBonus, 0.12, 14)
-    end
-    if isGoal and candidate.learnedD then
-        score = score - TuningBonusToSeconds(tuning.learnedPortalBonus, 0.12, 14)
-    end
+    -- Keep attach ranking source-neutral. Only transport-kind tuning may affect
+    -- the attach score; learned/manual/saved provenance must not add hidden preference.
     if (candidate.portalEdges or 0) > 0 then
         score = score - TuningBonusToSeconds(tuning.portalBonus, 0.08, 10)
     end
     if candidate.taxiHub or (candidate.taxiEdges or 0) > 0 then
         score = score - TuningBonusToSeconds(tuning.taxiBonus, 0.10, 12)
-    end
-
-    -- Saved routes should be strongly preferred only when the user's requested
-    -- destination is near the terminal point of that route.
-    if isGoal and candidate.knownRouteTerminal then
-        if rawWalkSeconds <= 180 then
-            score = score - 120
-        elseif rawWalkSeconds <= 300 then
-            score = score - 70
-        end
     end
 
     if score < 1 then score = 1 end
@@ -443,6 +531,7 @@ STATE = {
     recentInstanceEntryUntil = 0,
     cwModalStack = {},
     pendingDeathAutoRoute = nil,
+    deathAutoRouteContext = nil,
     lastDeathAutoRouteKey = nil,
     mapSaveRouteButtonHooksInstalled = false,
     deepSyncSkipCount = 0,
@@ -469,6 +558,7 @@ local EDGE_COLORS = {
     portal = "|cff66ffcc",
     transport = "|cffffff66",
     taxi = "|cffffdd55",
+    flight_master = "|cffffdd55",
     flying = "|cff88ff88",
 }
 
@@ -785,7 +875,7 @@ EnsureRoutingTuningUi = function()
 
     local f = CreateFrame('Frame', 'CustomWaypointsRoutingTuningFrame', UIParent)
     f:SetWidth(520)
-    f:SetHeight(430)
+    f:SetHeight(530)
     f:SetPoint('CENTER', UIParent, 'CENTER', 40, -20)
     -- Keep tuning above CW main UI to prevent visual mixing.
     f:SetFrameStrata('TOOLTIP')
@@ -852,6 +942,9 @@ EnsureRoutingTuningUi = function()
         { key = 'boatBonus', label = 'Boat preference', min = 0, max = 300, step = 5 },
         { key = 'zeppelinBonus', label = 'Zeppelin preference', min = 0, max = 300, step = 5 },
         { key = 'taxiBonus', label = 'Flight master preference', min = 0, max = 300, step = 5 },
+        { key = 'flightMasterBoardingSeconds', label = 'Flight master boarding seconds', min = 0, max = 180, step = 1 },
+        { key = 'flightMasterSpeedYardsPerSecond', label = 'Flight master speed (yd/s)', min = 1, max = 60, step = 1 },
+        { key = 'flightMasterLandingSeconds', label = 'Flight master landing seconds', min = 0, max = 120, step = 1 },
         { key = 'maxPostPortalWalkWithoutTaxi', label = 'Max post-portal walk w/o taxi (yards)', min = 0, max = 700, step = 5 },
     }
 
@@ -985,12 +1078,25 @@ local function ToggleRoutingTuningUi()
 end
 
 local function TransportLabel(edge)
-    return tostring(edge.label or ("Learned Portal: " .. tostring(edge.fromMapName or edge.fromMaI or "?") .. " -> " .. tostring(edge.toMapName or edge.toMaI or "?")))
+    edge = NormalizeTransportRecord(edge)
+    local kind = CanonicalTransportKind(GetEdgeTransportKind(edge))
+    local prefix = "Learned transport"
+    if kind == "portal" then
+        prefix = "Learned Portal"
+    elseif kind == "zeppelin" then
+        prefix = "Zeppelin"
+    elseif kind == "boat" then
+        prefix = "Boat"
+    elseif kind == "tram" then
+        prefix = "Tram"
+    elseif kind == "flight_master" then
+        prefix = "Flight Master"
+    end
+    return tostring(edge.label or (prefix .. ": " .. tostring(edge.fromMapName or edge.fromMaI or "?") .. " -> " .. tostring(edge.toMapName or edge.toMaI or "?")))
 end
 
 local function LearnedTransportKey(edge)
-    if not edge or not edge.fromMaI or not edge.toMaI then return nil end
-    return tostring(edge.fromMaI) .. ">" .. tostring(edge.toMaI)
+    return BuildTransportRecordKey(edge)
 end
 
 local function HasLearnedTransportCoords(edge)
@@ -1009,6 +1115,7 @@ local function CompactLearnedTransports()
     local merged = {}
     local byKey = {}
     for _, edge in ipairs(learned) do
+        NormalizeTransportRecord(edge)
         local key = LearnedTransportKey(edge)
         if key and byKey[key] then
             local dst = byKey[key]
@@ -1057,6 +1164,7 @@ local function CompactLearnedTransports()
         else
             local copy = {}
             for k, v in pairs(edge) do copy[k] = v end
+            NormalizeTransportRecord(copy)
             merged[#merged + 1] = copy
             if key then
                 byKey[key] = copy
@@ -1099,7 +1207,7 @@ local function EscapePortableField(value)
     return gsub(tostring(value or ""), "|", "/")
 end
 
-local function NormalizeSignatureNumber(value, decimals)
+NormalizeSignatureNumber = function(value, decimals)
     value = tonumber(value)
     if value == nil then return "?" end
     local fmt = "%0." .. tostring(decimals or 3) .. "f"
@@ -1126,7 +1234,20 @@ BuildKnownLocationSignature = function(loc)
         for i, pt in ipairs(loc.routePoints) do
             parts[i] = BuildWaypointSignature(pt)
         end
-        return "route|" .. tostring(#parts) .. "|" .. table.concat(parts, ">")
+        local chain = table.concat(parts, ">")
+        local transportKind = CanonicalTransportKind(InferStoredTransportKind(loc) or "route")
+        local bidirectional = (loc.bidirectional == true) or (transportKind == "flight_master")
+        if bidirectional and #parts >= 2 then
+            local rev = {}
+            for i = #parts, 1, -1 do
+                rev[#rev + 1] = parts[i]
+            end
+            local revChain = table.concat(rev, ">")
+            if revChain < chain then
+                chain = revChain
+            end
+        end
+        return "route|" .. transportKind .. "|b=" .. tostring(bidirectional and 1 or 0) .. "|" .. tostring(#parts) .. "|" .. chain
     end
 
     local dest = loc.destination or loc.lastTarget or loc.previousTarget
@@ -1134,6 +1255,8 @@ BuildKnownLocationSignature = function(loc)
     return table.concat({
         tostring(loc.kind or "known"),
         tostring(loc.instanceType or ""),
+        tostring(CanonicalTransportKind(InferStoredTransportKind(loc) or "")),
+        tostring(((loc.bidirectional == true) or CanonicalTransportKind(InferStoredTransportKind(loc)) == "flight_master") and 1 or 0),
         BuildWaypointSignature(dest),
     }, "|")
 end
@@ -1411,10 +1534,13 @@ local function BuildKnownLocationExportHeader(loc)
         EscapePortableField(loc.label or ""),
         EscapePortableField(loc.description or ""),
         EscapePortableField(loc.instanceType or ""),
+        EscapePortableField(CanonicalTransportKind(InferStoredTransportKind(loc) or "")),
+        tostring(((loc.bidirectional == true) or CanonicalTransportKind(InferStoredTransportKind(loc)) == "flight_master") and 1 or 0),
     }, "|")
 end
 
 local function BuildLearnedTransportExportHeader(edge)
+    edge = NormalizeTransportRecord(edge)
     return table.concat({
         "CWKNOWN",
         "transport",
@@ -1422,10 +1548,13 @@ local function BuildLearnedTransportExportHeader(edge)
         "",
         "",
         EscapePortableField(edge.toInstanceType or edge.fromInstanceType or ""),
+        EscapePortableField(CanonicalTransportKind(edge.transportKind or "transport")),
+        tostring(IsBidirectionalTransportRecord(edge) and 1 or 0),
     }, "|")
 end
 
 local function SerializeLearnedTransportLine(edge)
+    edge = NormalizeTransportRecord(edge)
     return table.concat({
         "T",
         tostring(edge.fromMaI or "?"),
@@ -1447,6 +1576,8 @@ local function SerializeLearnedTransportLine(edge)
         EscapePortableField(edge.fromInstanceType or ""),
         tostring(edge.toInstance and 1 or 0),
         EscapePortableField(edge.toInstanceType or ""),
+        EscapePortableField(CanonicalTransportKind(edge.transportKind or "transport")),
+        tostring(IsBidirectionalTransportRecord(edge) and 1 or 0),
     }, "|")
 end
 
@@ -1499,7 +1630,7 @@ local function ParseLearnedTransportLine(line)
         return nil, "bad-transport-coords"
     end
 
-    return {
+    return NormalizeTransportRecord({
         fromMaI = fromMaI,
         fromMapName = fromMapName,
         fromZx = fromZx,
@@ -1519,7 +1650,9 @@ local function ParseLearnedTransportLine(line)
         fromInstanceType = parts[18] ~= "" and parts[18] or nil,
         toInstance = parts[19] == "1" and true or nil,
         toInstanceType = parts[20] ~= "" and parts[20] or nil,
-    }, nil
+        transportKind = (#parts >= 21 and parts[21] ~= "" and parts[21] ~= "?" and parts[21]) or nil,
+        bidirectional = (#parts >= 22 and parts[22] == "1") and true or nil,
+    }), nil
 end
 
 local function ParseKnownLocationHeader(line)
@@ -1539,6 +1672,8 @@ local function ParseKnownLocationHeader(line)
         label = parts[4] ~= "" and parts[4] or nil,
         description = parts[5] ~= "" and parts[5] or nil,
         instanceType = parts[6] ~= "" and parts[6] or nil,
+        transportKind = parts[7] ~= "" and parts[7] or nil,
+        bidirectional = parts[8] == "1" and true or nil,
     }
 end
 
@@ -1555,6 +1690,8 @@ local function FinalizeImportedKnownLocation(header, routePoints)
             routePoints = CloneDestinations(routePoints),
             destination = CloneDestination(routePoints[#routePoints]),
             mapName = routePoints[#routePoints] and routePoints[#routePoints].mapName or nil,
+            transportKind = CanonicalTransportKind(header.transportKind or "route"),
+            bidirectional = (header.bidirectional == true) or CanonicalTransportKind(header.transportKind) == "flight_master",
             discoveredBy = "import-known-locations",
         }, nil
     end
@@ -1571,6 +1708,8 @@ local function FinalizeImportedKnownLocation(header, routePoints)
         mapName = dest and dest.mapName or nil,
         instance = (header.kind == "instance") and true or nil,
         instanceType = header.instanceType,
+        transportKind = CanonicalTransportKind(header.transportKind or ""),
+        bidirectional = (header.bidirectional == true) or CanonicalTransportKind(header.transportKind) == "flight_master",
         discoveredBy = "import-known-locations",
     }, nil
 end
@@ -1759,6 +1898,8 @@ local function BuildKnownLocationEntries()
                 instanceType = nil,
                 sourceType = "knownRoute",
                 sourceIndex = i,
+                transportKind = CanonicalTransportKind(InferStoredTransportKind(loc) or "route"),
+                bidirectional = (loc.bidirectional == true) or CanonicalTransportKind(InferStoredTransportKind(loc)) == "flight_master",
             })
         else
             local dest = CloneKnownLocationDestination(loc)
@@ -1780,6 +1921,8 @@ local function BuildKnownLocationEntries()
                     instanceType = loc.instanceType or dest.instanceType,
                     sourceType = "knownLocation",
                     sourceIndex = i,
+                    transportKind = CanonicalTransportKind(InferStoredTransportKind(loc) or ""),
+                    bidirectional = (loc.bidirectional == true) or CanonicalTransportKind(InferStoredTransportKind(loc)) == "flight_master",
                 })
             end
         end
@@ -1808,8 +1951,9 @@ local function BuildKnownLocationEntries()
             instanceType = edge.toInstanceType,
         }
 
+        NormalizeTransportRecord(edge)
         addEntry({
-            key = "transport|" .. tostring(i) .. "|" .. tostring(edge.fromMaI or "?") .. ">" .. tostring(edge.toMaI or "?"),
+            key = "transport|" .. tostring(i) .. "|" .. tostring(BuildTransportRecordKey(edge) or (tostring(edge.fromMaI or "?") .. ">" .. tostring(edge.toMaI or "?"))),
             kind = "transport",
             name = TransportLabel(edge),
             mapName = destPt.mapName,
@@ -1820,6 +1964,8 @@ local function BuildKnownLocationEntries()
             instanceType = destPt.instanceType,
             sourceType = "learnedTransport",
             sourceIndex = i,
+            transportKind = CanonicalTransportKind(edge.transportKind or "transport"),
+            bidirectional = IsBidirectionalTransportRecord(edge),
         })
     end
 
@@ -1860,6 +2006,9 @@ local function EntryMatchesFilters(entry, ui)
         return false
     end
     if ui and ui.instancesOnly and not entry.instance then
+        return false
+    end
+    if ui and ui.flightMastersOnly and CanonicalTransportKind(entry.transportKind or "") ~= "flight_master" then
         return false
     end
     if ui and ui.searchText and ui.searchText ~= "" and not EntryContainsQuery(entry, ui.searchText) then
@@ -2041,11 +2190,15 @@ SaveQueueAsKnownRoute = function()
         defaultName = "Route " .. date("%Y-%m-%d %H:%M"),
         defaultLabel = "route",
         defaultDescription = "",
+        extraCheckboxes = {
+            { key = "flightMaster", label = "Flight Master", checked = false },
+        },
         onSave = function(meta)
             local key = "route|" .. tostring(time and time() or GetTime() or math.random(100000, 999999))
             local routePoints = CloneDestinations(STATE.db.destinations)
             STATE.db.knownLocations = STATE.db.knownLocations or {}
 
+            local isFlightMaster = meta.extraValues and meta.extraValues.flightMaster == true
             local candidate = {
                 key = key,
                 kind = "route",
@@ -2055,6 +2208,8 @@ SaveQueueAsKnownRoute = function()
                 routePoints = routePoints,
                 destination = CloneDestination(routePoints[#routePoints]),
                 mapName = routePoints[#routePoints] and routePoints[#routePoints].mapName or nil,
+                transportKind = isFlightMaster and "flight_master" or "route",
+                bidirectional = isFlightMaster and true or false,
                 discoveredBy = "manual-saveroute",
             }
 
@@ -2245,8 +2400,16 @@ local function ShowKnownPointEditorPopup(sourceIndex, loc, titleText)
     descBox:SetPoint("LEFT", descLabel, "RIGHT", 10, 0)
     descBox:SetText(loc.description or "")
 
+    local fmCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    fmCheck:SetPoint("TOPLEFT", descLabel, "BOTTOMLEFT", 0, -18)
+    fmCheck:SetChecked(CanonicalTransportKind(loc.transportKind or "") == "flight_master")
+
+    local fmLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    fmLabel:SetPoint("LEFT", fmCheck, "RIGHT", 2, 0)
+    fmLabel:SetText("Flight Master")
+
     local pointLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    pointLabel:SetPoint("TOPLEFT", descLabel, "BOTTOMLEFT", 0, -22)
+    pointLabel:SetPoint("TOPLEFT", fmCheck, "BOTTOMLEFT", 0, -18)
     pointLabel:SetText("Import block")
 
     local scroll = CreateFrame("ScrollFrame", frameName .. "Scroll", f, "UIPanelScrollFrameTemplate")
@@ -2395,9 +2558,12 @@ local function ShowKnownPointEditorPopup(sourceIndex, loc, titleText)
             edge.fromInstanceType = parsedTransport.fromInstanceType
             edge.toInstance = parsedTransport.toInstance
             edge.toInstanceType = parsedTransport.toInstanceType
+            edge.transportKind = fmCheck:GetChecked() and "flight_master" or CanonicalTransportKind(parsedTransport.transportKind or "transport")
+            edge.bidirectional = fmCheck:GetChecked() and true or (parsedTransport.bidirectional and true or false)
             if parsedTransport.label and parsedTransport.label ~= "" then
                 edge.label = parsedTransport.label
             end
+            NormalizeTransportRecord(edge)
 
             RefreshKnownLocationsFrame()
             InvalidateRoute("edited known transport from unified editor")
@@ -2439,6 +2605,8 @@ local function ShowKnownPointEditorPopup(sourceIndex, loc, titleText)
         stored.kind = "route"
         stored.instance = candidate.instance
         stored.instanceType = candidate.instanceType
+        stored.transportKind = fmCheck:GetChecked() and "flight_master" or CanonicalTransportKind(candidate.transportKind or "route")
+        stored.bidirectional = fmCheck:GetChecked() and true or false
 
         NormalizeKnownLocationAfterEdit(stored)
         InvalidateRoute("edited known route")
@@ -2485,6 +2653,8 @@ ShowKnownLocationEditorPopup = function(sourceIndex)
                 maI = edge.toMaI, mapName = edge.toMapName, zx = edge.toZx, zy = edge.toZy, wx = edge.toWx, wy = edge.toWy,
                 instance = edge.toInstance, instanceType = edge.toInstanceType,
             },
+            transportKind = CanonicalTransportKind(edge.transportKind or "transport"),
+            bidirectional = IsBidirectionalTransportRecord(edge),
         }
     end
 
@@ -3253,8 +3423,23 @@ ShowKnownLocationsFrame = function()
     routesLabel:SetPoint("LEFT", routesCheck, "RIGHT", 2, 0)
     routesLabel:SetText("Routes only")
 
+    local flightMastersCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    flightMastersCheck:SetPoint("LEFT", routesLabel, "RIGHT", 18, 0)
+    flightMastersCheck:SetChecked(false)
+    flightMastersCheck:SetScript("OnClick", function(self)
+        if STATE.knownLocationsUi then
+            STATE.knownLocationsUi.flightMastersOnly = self:GetChecked() and true or false
+            STATE.knownLocationsUi.selectedIndex = nil
+            RefreshKnownLocationsFrame()
+        end
+    end)
+
+    local flightMastersLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    flightMastersLabel:SetPoint("LEFT", flightMastersCheck, "RIGHT", 2, 0)
+    flightMastersLabel:SetText("Flight Masters only")
+
     local transportsCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
-    transportsCheck:SetPoint("LEFT", routesLabel, "RIGHT", 18, 0)
+    transportsCheck:SetPoint("LEFT", flightMastersLabel, "RIGHT", 18, 0)
     transportsCheck:SetChecked(false)
     transportsCheck:SetScript("OnClick", function(self)
         if STATE.knownLocationsUi then
@@ -3988,6 +4173,33 @@ local function EnsureUi()
     return STATE.ui
 end
 
+local function ResetDeathAutoRouteCycle()
+    STATE.lastDeathAutoRouteKey = nil
+    STATE.pendingDeathAutoRoute = nil
+    STATE.deathAutoRouteContext = nil
+end
+
+local function CaptureDeathInstanceContext()
+    local pos = GetPlayerWorldPos()
+    if pos and pos.instance then
+        return ClonePersistentInstanceContext(pos)
+    end
+
+    local stable = STATE.lastStablePlayerPos
+    if stable and stable.instance then
+        return ClonePersistentInstanceContext(stable)
+    end
+
+    return nil
+end
+
+local function ClearCorpseInstanceContext()
+    EnsureDb()
+    if STATE.db then
+        STATE.db.corpseInstanceContext = nil
+    end
+end
+
 local function EnsureInterfaceOptionsPanel()
     if STATE.interfacePanel then
         RefreshUiHeader()
@@ -4039,11 +4251,16 @@ local function EnsureInterfaceOptionsPanel()
 
         if not enabled then
             ClearPendingDeathAutoRoute()
-            STATE.lastDeathAutoRouteKey = nil
+            ResetDeathAutoRouteCycle()
+            ClearCorpseInstanceContext()
         else
             local deadOrGhost = UnitIsDeadOrGhost and UnitIsDeadOrGhost("player")
             if deadOrGhost then
-                StartPendingDeathAutoRoute(0.20)
+                local deathContext = CaptureDeathInstanceContext()
+                if deathContext then
+                    RememberCorpseInstanceContext(deathContext)
+                    StartPendingDeathAutoRoute(0.20, deathContext)
+                end
             end
         end
     end)
@@ -4301,23 +4518,30 @@ function ClearPendingDeathAutoRoute()
     STATE.pendingDeathAutoRoute = nil
 end
 
-local function ResetDeathAutoRouteCycle()
-    STATE.lastDeathAutoRouteKey = nil
-    STATE.pendingDeathAutoRoute = nil
+local function ClonePersistentInstanceContext(pt)
+    if not pt then return nil end
+    local copy = CloneWorldPoint(pt) or {}
+    copy.instance = true
+    copy.instanceType = copy.instanceType or "instance"
+    return copy
 end
 
-function StartPendingDeathAutoRoute(delay)
+function StartPendingDeathAutoRoute(delay, deathContext)
     EnsureDb()
-    if not (STATE.db and STATE.db.autoRouteSavedInstanceOnDeath) then return end
+    if not (STATE.db and STATE.db.autoRouteSavedInstanceOnDeath) then return false end
+    if not (deathContext and deathContext.instance) then return false end
 
     local now = GetTime and GetTime() or 0
+    STATE.deathAutoRouteContext = ClonePersistentInstanceContext(deathContext)
     STATE.pendingDeathAutoRoute = {
         startedAt = now,
         nextAttemptAt = now + (tonumber(delay) or 0.35),
         attempts = 0,
+        sourceContext = ClonePersistentInstanceContext(deathContext),
     }
 
     dbg("death auto-route queued")
+    return true
 end
 
 GetPlayerWorldPos = function()
@@ -4411,14 +4635,6 @@ GetPlayerWorldPos = function()
     return nil
 end
 
-local function ClonePersistentInstanceContext(pt)
-    if not pt then return nil end
-    local copy = CloneWorldPoint(pt) or {}
-    copy.instance = true
-    copy.instanceType = copy.instanceType or "instance"
-    return copy
-end
-
 local function RememberPersistentInstanceContext(pt)
     EnsureDb()
     if not (STATE.db and pt and pt.instance) then return end
@@ -4431,26 +4647,16 @@ local function RememberCorpseInstanceContext(pt)
     STATE.db.corpseInstanceContext = ClonePersistentInstanceContext(pt)
 end
 
-local function ClearCorpseInstanceContext()
-    EnsureDb()
-    if STATE.db then
-        STATE.db.corpseInstanceContext = nil
-    end
-end
-
 local function GetBestInstanceContextForDeathRouting()
-    local pos = GetPlayerWorldPos()
-    if pos and pos.instance then
-        return pos
+    local pending = STATE.pendingDeathAutoRoute
+    if pending and pending.sourceContext and pending.sourceContext.instance then
+        return pending.sourceContext
     end
-    if STATE.lastInstanceStablePlayerPos and STATE.lastInstanceStablePlayerPos.instance then
-        return STATE.lastInstanceStablePlayerPos
+    if STATE.deathAutoRouteContext and STATE.deathAutoRouteContext.instance then
+        return STATE.deathAutoRouteContext
     end
     if STATE.db and STATE.db.corpseInstanceContext and STATE.db.corpseInstanceContext.instance then
         return STATE.db.corpseInstanceContext
-    end
-    if STATE.db and STATE.db.lastInstanceContext and STATE.db.lastInstanceContext.instance then
-        return STATE.db.lastInstanceContext
     end
     return nil
 end
@@ -4484,16 +4690,13 @@ end
 
 function PulsePendingDeathAutoRoute()
     local pending = STATE.pendingDeathAutoRoute
-
-    if not pending then
-        local deadOrGhost = UnitIsDeadOrGhost and UnitIsDeadOrGhost("player")
-        if deadOrGhost and STATE.db and (STATE.db.corpseInstanceContext or STATE.db.lastInstanceContext) then
-            StartPendingDeathAutoRoute(0.15)
-            pending = STATE.pendingDeathAutoRoute
-        end
-    end
-
     if not pending then return end
+
+    local deadOrGhost = UnitIsDeadOrGhost and UnitIsDeadOrGhost("player")
+    if not deadOrGhost then
+        ClearPendingDeathAutoRoute()
+        return
+    end
 
     local now = GetTime and GetTime() or 0
     if now < (pending.nextAttemptAt or 0) then return end
@@ -5054,6 +5257,54 @@ local function RequestLearnedTransportConfirmation(fromPos, toPos, reason)
     pr("learned transport: " .. tostring(fromPos.mapName or fromPos.maI) .. " -> " .. tostring(toPos.mapName or toPos.maI))
 end
 
+local function TransportCostSeconds(transportType, wx1, wy1, wx2, wy2)
+    transportType = CanonicalTransportKind(transportType)
+    local travel = WalkCostSeconds(wx1, wy1, wx2, wy2)
+    local base
+    local tuning = GetRoutingTuning()
+
+    if transportType == "portal" then
+        -- Keep portal preference tuning-controlled; when portal bonus is zero,
+        -- avoid a hidden always-cheap portal base.
+        if (tuning.portalBonus or 0) <= 0 then
+            base = 60 + travel * 0.3
+        else
+            base = 25
+        end
+    elseif transportType == "tram" then
+        base = 45 + travel * 0.2
+    elseif transportType == "zeppelin" then
+        base = 75 + travel * 0.2
+    elseif transportType == "boat" then
+        base = 90 + travel * 0.2
+    elseif transportType == "flight_master" then
+        local yards = WorldToYards(Dist(wx1, wy1, wx2, wy2))
+        local speed = tonumber(tuning.flightMasterSpeedYardsPerSecond) or 15
+        if speed < 1 then speed = 1 end
+        base = (tonumber(tuning.flightMasterBoardingSeconds) or 20)
+            + (yards / speed)
+            + (tonumber(tuning.flightMasterLandingSeconds) or 12)
+    else
+        base = 60 + travel * 0.3
+    end
+
+    local adjusted = base - GetTransportPreferenceReductionSeconds(transportType, false)
+
+    if transportType == "portal" then
+        if adjusted < 7 then adjusted = 7 end
+    elseif transportType == "tram" then
+        if adjusted < 18 then adjusted = 18 end
+    elseif transportType == "zeppelin" or transportType == "boat" then
+        if adjusted < 35 then adjusted = 35 end
+    elseif transportType == "flight_master" then
+        if adjusted < 20 then adjusted = 20 end
+    else
+        if adjusted < 10 then adjusted = 10 end
+    end
+
+    return adjusted
+end
+
 local function InjectLearnedTransportEdges(addNode, addEdge, graph)
     local learned = EnsureTransportDb()
     if not learned or #learned == 0 then return end
@@ -5069,10 +5320,11 @@ local function InjectLearnedTransportEdges(addNode, addEdge, graph)
                 graph.nodes[n2].learnedPortalDest = true
                 graph.nodes[n2].learnedPortalLabel = TransportLabel(edge)
             end
-            local hopCost = 22 - GetTransportPreferenceReductionSeconds(edge.type or "portal", true)
-            if hopCost < 4 then hopCost = 4 end
-            addEdge(n1, n2, hopCost, edge.type or "portal", TransportLabel(edge), false, { learnedHop = true })
-            graph.links[#graph.links + 1] = { a = n1, b = n2, type = edge.type or "portal", learned = true }
+            NormalizeTransportRecord(edge)
+            local edgeType = CanonicalTransportKind(edge.transportKind or edge.type or "transport")
+            local hopCost = TransportCostSeconds(edgeType, edge.fromWx, edge.fromWy, edge.toWx, edge.toWy)
+            addEdge(n1, n2, hopCost, edgeType, TransportLabel(edge), IsBidirectionalTransportRecord(edge), { learnedHop = (edgeType == "portal") })
+            graph.links[#graph.links + 1] = { a = n1, b = n2, type = edgeType, learned = true, bidirectional = IsBidirectionalTransportRecord(edge) }
         end
     end
 end
@@ -5080,10 +5332,12 @@ end
 -- Known-route hops are intentional user-authored shortcuts. Keep them in the
 -- deep graph with a strongly preferred synthetic hop cost so the pathfinder
 -- will choose a saved route when it actually lines up with the requested trip.
-local function GetKnownRouteHopCostSeconds()
-    local hopCost = 22 - GetTransportPreferenceReductionSeconds("portal", true)
-    if hopCost < 6 then hopCost = 6 end
-    return hopCost
+local function GetKnownRouteHopCostSeconds(loc, a, b)
+    local transportKind = CanonicalTransportKind(InferStoredTransportKind(loc) or "route")
+    if transportKind == "route" then
+        return math.max(6, WalkCostSeconds(a.wx, a.wy, b.wx, b.wy))
+    end
+    return TransportCostSeconds(transportKind, a.wx, a.wy, b.wx, b.wy)
 end
 
 local function InjectKnownRouteEdges(addNode, addEdge, graph)
@@ -5118,8 +5372,10 @@ local function InjectKnownRouteEdges(addNode, addEdge, graph)
                         end
                     end
 
-                    addEdge(n1, n2, GetKnownRouteHopCostSeconds(), "route", "Known route: " .. routeName, true)
-                    graph.links[#graph.links + 1] = { a = n1, b = n2, type = "route", knownRoute = true }
+                    local routeKind = CanonicalTransportKind(InferStoredTransportKind(loc) or "route")
+                    local isBidirectional = (loc.bidirectional == true) or routeKind == "flight_master"
+                    addEdge(n1, n2, GetKnownRouteHopCostSeconds(loc, a, b), routeKind, "Known route: " .. routeName, isBidirectional)
+                    graph.links[#graph.links + 1] = { a = n1, b = n2, type = routeKind, knownRoute = true, bidirectional = isBidirectional }
                 end
             end
         end
@@ -5234,6 +5490,7 @@ local function PulseTransportDiscovery(elapsed)
             STATE.lastStablePlayerPos = CloneWorldPoint(current)
             if current.instance then
                 STATE.lastInstanceStablePlayerPos = CloneWorldPoint(current)
+                RememberPersistentInstanceContext(current)
             else
                 STATE.lastNonInstanceStablePlayerPos = CloneWorldPoint(current)
             end
@@ -5487,53 +5744,12 @@ end
 
 local function InferTransportType(name1, name2)
     local s = lower((name1 or "") .. " " .. (name2 or ""))
+    if match(s, "flight master") or match(s, "taxi") or match(s, "gryphon") or match(s, "wind rider") then return "flight_master" end
     if match(s, "zeppelin") then return "zeppelin" end
     if match(s, "boat") then return "boat" end
     if match(s, "tram") then return "tram" end
     if match(s, "portal") then return "portal" end
     return "transport"
-end
-
-local function TransportCostSeconds(transportType, wx1, wy1, wx2, wy2)
-    local travel = WalkCostSeconds(wx1, wy1, wx2, wy2)
-    local base
-    local tuning = GetRoutingTuning()
-
-    if transportType == "portal" then
-        -- Keep portal preference tuning-controlled; when portal bonus is zero,
-        -- avoid a hidden always-cheap portal base.
-        if (tuning.portalBonus or 0) <= 0 then
-            base = 60 + travel * 0.3
-        else
-            base = 25
-        end
-    elseif transportType == "tram" then
-        base = 45 + travel * 0.2
-    elseif transportType == "zeppelin" then
-        base = 75 + travel * 0.2
-    elseif transportType == "boat" then
-        base = 90 + travel * 0.2
-    elseif transportType == "taxi" then
-        base = 60 + travel * 0.3
-    else
-        base = 60 + travel * 0.3
-    end
-
-    local adjusted = base - GetTransportPreferenceReductionSeconds(transportType, false)
-
-    if transportType == "portal" then
-        if adjusted < 7 then adjusted = 7 end
-    elseif transportType == "tram" then
-        if adjusted < 18 then adjusted = 18 end
-    elseif transportType == "zeppelin" or transportType == "boat" then
-        if adjusted < 35 then adjusted = 35 end
-    elseif transportType == "taxi" then
-        if adjusted < 20 then adjusted = 20 end
-    else
-        if adjusted < 10 then adjusted = 10 end
-    end
-
-    return adjusted
 end
 
 local function IsRealTransportType(edgeType)
@@ -5786,8 +6002,8 @@ local function EnsureGraph()
                     else
                         local ok, directCost = pcall(Nx.Tra.TFCT, Nx.Tra, a.taxiName, b.taxiName)
                         if ok and directCost and directCost > 0 then
-                            addEdge(a.id, b.id, directCost, "taxi", format("Flight Master: %s -> %s", tostring(a.taxiName), tostring(b.taxiName)), true)
-                            graph.links[#graph.links + 1] = {a = a.id, b = b.id, type = "taxi"}
+                            addEdge(a.id, b.id, TransportCostSeconds("flight_master", a.wx, a.wy, b.wx, b.wy), "flight_master", format("Flight Master: %s -> %s", tostring(a.taxiName), tostring(b.taxiName)), true)
+                            graph.links[#graph.links + 1] = {a = a.id, b = b.id, type = "flight_master"}
                         end
                     end
                 end
@@ -6024,12 +6240,12 @@ local function CollapseDeepTaxiChains(points)
     while i <= #points do
         local pt = points[i]
 
-        if pt and pt.edgeType == "taxi" then
+        if pt and (pt.edgeType == "taxi" or pt.edgeType == "flight_master") then
             local chainStart = i
             local chainEnd = i
             local totalTaxiCost = tonumber(pt.cost) or 0
 
-            while chainEnd + 1 <= #points and points[chainEnd + 1] and points[chainEnd + 1].edgeType == "taxi" do
+            while chainEnd + 1 <= #points and points[chainEnd + 1] and (points[chainEnd + 1].edgeType == "taxi" or points[chainEnd + 1].edgeType == "flight_master") do
                 chainEnd = chainEnd + 1
                 totalTaxiCost = totalTaxiCost + (tonumber(points[chainEnd].cost) or 0)
             end
@@ -6701,6 +6917,27 @@ local function ShowWaypointMetadataPopup(opts)
     descBox:SetText(opts.defaultDescription or "")
     descBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 
+    local extraCheckboxes = {}
+    local lastAnchor = descLabel
+    if type(opts.extraCheckboxes) == "table" and #opts.extraCheckboxes > 0 then
+        for i, def in ipairs(opts.extraCheckboxes) do
+            local cb = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+            cb:SetPoint("TOPLEFT", lastAnchor, "BOTTOMLEFT", 0, (i == 1) and -22 or -26)
+            cb:SetChecked(def.checked and true or false)
+
+            local cbLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            cbLabel:SetPoint("LEFT", cb, "RIGHT", 2, 0)
+            cbLabel:SetText(def.label or tostring(def.key or i))
+
+            extraCheckboxes[#extraCheckboxes + 1] = {
+                key = def.key or tostring(i),
+                check = cb,
+                label = cbLabel,
+            }
+            lastAnchor = cb
+        end
+    end
+
     local saveBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     saveBtn:SetWidth(80)
     saveBtn:SetHeight(22)
@@ -6708,10 +6945,15 @@ local function ShowWaypointMetadataPopup(opts)
     saveBtn:SetText("Save")
     saveBtn:SetScript("OnClick", function()
         if opts.onSave then
+            local extraValues = {}
+            for _, info in ipairs(extraCheckboxes) do
+                extraValues[info.key] = info.check:GetChecked() and true or false
+            end
             opts.onSave({
                 name = TrimEditorMetadataValue(nameBox:GetText()),
                 label = TrimEditorMetadataValue(labelBox:GetText()),
                 description = TrimEditorMetadataValue(descBox:GetText()),
+                extraValues = extraValues,
             })
         end
         f:Hide()
@@ -7494,11 +7736,19 @@ local function OnEvent(_, event)
     elseif event == "PLAYER_DEAD" then
         EnsureDb()
         ResetDeathAutoRouteCycle()
-        StartPendingDeathAutoRoute(0.20)
+
+        local deathContext = CaptureDeathInstanceContext()
+        if deathContext then
+            RememberCorpseInstanceContext(deathContext)
+            StartPendingDeathAutoRoute(0.20, deathContext)
+        else
+            ClearCorpseInstanceContext()
+            dbg("death auto-route skipped: death did not occur in known instance context")
+        end
     elseif event == "PLAYER_ALIVE" or event == "PLAYER_UNGHOST" then
         EnsureDb()
         ResetDeathAutoRouteCycle()
-        StartPendingDeathAutoRoute(0.35)
+        ClearCorpseInstanceContext()
     elseif event == "PLAYER_REGEN_DISABLED" or event == "PLAYER_REGEN_ENABLED" then
         RefreshCwEscOverride()
     end
