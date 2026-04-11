@@ -16,7 +16,7 @@ This repo bundles a **Wrath-era (3.3.5a)** Carbonite tree with **CustomWaypoints
 
 ## Trying CustomWaypoints
 
-1. Copy **`Carbonite`** and **`CustomWaypoints`** into `Interface\AddOns\`.
+1. Copy repo's folders into `Interface\AddOns\`.
 2. In-game: **`/cw help`** — default capture is **Shift+left-click** on the Carbonite world map.
 > ⚠️ Important: This functionality only works on the character’s current map (via the minimap). Use the world map to navigate between different zones.
 3. Maintenance / “what must not break” lives in **`CustomWaypoints/CHECKPOINT.md`**.
@@ -27,13 +27,14 @@ This repo bundles a **Wrath-era (3.3.5a)** Carbonite tree with **CustomWaypoints
 | Shortcut | Action |
 |----------|--------|
 | **Shift + Left Click** | Capture waypoint from Carbonite world map |
+| **Ctrl + Shift + Left Click** | Capture waypoint with metadata |
 | **Ctrl + Right Click** | Fallback waypoint capture |
-| **Ctrl + Shift + Z** | Undo last action |
-| **Ctrl + Shift + Y** | Redo last undone action |
+| **Ctrl + Shift + Z** | Undo last action (from waypoint queue) |
+| **Ctrl + Shift + Y** | Redo last undone action (from waypoint queue) |
 | **Shift + R** | Save waypoint at current player location and disable auto-advance  -- debug/route-recording feature (Save Here) |
 | **SHIFT + G** | Open Known Locations window |
 | **ESC** | Close most recently opened CustomWaypoints UI frame |
-| **DELETE** | Delete selected entries (e.g. in Known Locations UI) |
+| **SHIFT-DELETE or CTRL-BACKSPACE** | Delete selected entry (in Known Locations UI) |
 
 > ⚠️ Note: Some keybinds may not work if overridden by other addons (e.g. Carbonite) or existing WoW bindings.
 ---
@@ -94,3 +95,18 @@ This repo bundles a **Wrath-era (3.3.5a)** Carbonite tree with **CustomWaypoints
 - Custom graph-based routing (Dijkstra-style)
 - Uses learned transports and extended graph
 - May produce unexpected fallbacks
+
+> ⚠️ Note: There may be stuttering when the addon is used alongside Questie.
+
+
+### Map Data Collection
+CustomWaypoints isn’t just about routing — it’s also an ongoing effort to build a reliable, community-driven dataset of map knowledge across WotLK.
+
+Many areas in 3.3.5a (especially instances, transports, and edge-case transitions) are incomplete or inconsistent. The goal is to gradually record, validate, and refine real in-game paths and connections through actual gameplay, creating a high-quality routing layer that goes beyond static data.
+
+Every route, portal, or edge discovered adds value — and this is something that scales best with community input.
+
+If you’d like to contribute or just explore what’s already been collected, you can check the current dataset here:
+➡️ [CustomWaypoints/data/known_routes_export.txt](CustomWaypoints/data/known_routes_export.txt)
+
+Even small additions (a dungeon entrance, a working transport, a corrected path) help improve routing for everyone.

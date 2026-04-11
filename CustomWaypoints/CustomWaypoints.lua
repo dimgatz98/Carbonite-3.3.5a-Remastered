@@ -76,6 +76,7 @@ local TRANSIT_EDGE_TYPES = {
 BINDING_HEADER_CUSTOMWAYPOINTS = "CustomWaypoints"
 BINDING_NAME_CW_TOGGLE_KNOWN_LOCATIONS = "Toggle Known Locations"
 BINDING_NAME_CW_SAVE_HERE = "Save Here"
+BINDING_NAME_CW_DELETE_SELECTED_KNOWN_LOCATION = "Delete Selected Known Location"
 
 local DEFAULTS = {
     destinations = {},
@@ -535,6 +536,9 @@ STATE = {
     lastDeathAutoRouteKey = nil,
     mapSaveRouteButtonHooksInstalled = false,
     deepSyncSkipCount = 0,
+    lastGroundPlayerPos = nil,
+    wasOnTaxi = false,
+    pendingTaxiRouteRefresh = false,
 }
 
 -- NOTE:
@@ -546,6 +550,21 @@ STATE = {
 local function GetMap()
     if not Nx or not Nx.Map or not Nx.Map.GeM then return nil end
     return Nx.Map:GeM(1)
+end
+
+local function IsPlayerOnTaxi()
+    return UnitOnTaxi and UnitOnTaxi("player") and true or false
+end
+
+local function GetRouteBuildStartPoint()
+    local current = GetPlayerWorldPos()
+    if not current then return nil end
+
+    if IsPlayerOnTaxi() then
+        return CloneWorldPoint(STATE.lastGroundPlayerPos or STATE.lastNonTaxiPlayerPos or STATE.lastNonInstanceStablePlayerPos or current)
+    end
+
+    return current
 end
 
 local EDGE_COLORS = {
@@ -2284,11 +2303,6 @@ local function DeleteKnownLocationEntry(entry)
     local removed = known[sourceIndex]
     table.remove(known, sourceIndex)
 
-    if STATE.knownLocationsUi then
-        STATE.knownLocationsUi.selectedIndex = nil
-        STATE.knownLocationsUi.lastClickKey = nil
-    end
-
     InvalidateRoute("deleted known location entry")
     pr("deleted known location: " .. tostring((removed and removed.name) or entry.name or sourceIndex))
     return true
@@ -3253,7 +3267,8 @@ RefreshKnownLocationsFrame = function()
     end
 
     if ui.deleteSelectedBtn then
-        if ui.selectedIndex and visibleEntries[ui.selectedIndex] then
+        local selected = ui.selectedIndex and visibleEntries[ui.selectedIndex] or nil
+        if selected and selected.kind == "route" then
             ui.deleteSelectedBtn:Enable()
         else
             ui.deleteSelectedBtn:Disable()
@@ -3309,6 +3324,22 @@ ExportKnownLocations = function()
     pr(format("known locations export: %d known location(s), %d transport(s)", #known, #learned))
 end
 
+local function RestoreKnownLocationsSelectionAfterDelete(previousIndex)
+    local ui = STATE.knownLocationsUi
+    if not ui then return end
+
+    local visible = ui.visibleEntries or {}
+    if type(previousIndex) ~= "number" or previousIndex < 1 or previousIndex > #visible then
+        ui.selectedIndex = nil
+        ui.lastClickKey = nil
+        ui.lastClickTime = nil
+        return
+    end
+
+    ui.selectedIndex = previousIndex
+    ui.lastClickKey = nil
+    ui.lastClickTime = nil
+end
 
 ShowKnownLocationsFrame = function()
     if STATE.knownLocationsUi and STATE.knownLocationsUi.frame then
@@ -3514,18 +3545,20 @@ ShowKnownLocationsFrame = function()
     deleteSelectedBtn:SetScript("OnClick", function()
         local ui = STATE.knownLocationsUi
         if not ui or not ui.selectedIndex or not ui.visibleEntries or not ui.visibleEntries[ui.selectedIndex] then
-            pr("delete failed: no known location selected")
+            pr("delete failed: no known route selected")
             return
         end
-        local chosen = ui.visibleEntries[ui.selectedIndex]
+
+        local previousIndex = ui.selectedIndex
+        local chosen = ui.visibleEntries[previousIndex]
+
         if DeleteKnownLocationEntry(chosen) then
-            ui.selectedIndex = nil
-            ui.lastClickKey = nil
-            ui.lastClickTime = nil
+            RefreshKnownLocationsFrame()
+            RestoreKnownLocationsSelectionAfterDelete(previousIndex)
             RefreshKnownLocationsFrame()
         end
     end)
-    
+
     STATE.knownLocationsUi = {
         frame = f,
         content = content,
@@ -3537,6 +3570,7 @@ ShowKnownLocationsFrame = function()
         instanceCheck = instanceCheck,
         routesCheck = routesCheck,
         transportsCheck = transportsCheck,
+        deleteSelectedBtn = deleteSelectedBtn,
         searchText = "",
         instancesOnly = false,
         routesOnly = false,
@@ -3905,6 +3939,31 @@ function CustomWaypoints_SaveHere()
     AddCurrentLocationWithMetadataPopup()
 end
 
+function CW_DELETE_SELECTED_KNOWN_LOCATION()
+    CustomWaypoints_DeleteSelectedKnownLocation()
+end
+
+function CustomWaypoints_DeleteSelectedKnownLocation()
+    local ui = STATE.knownLocationsUi
+    if not ui or not ui.frame or not ui.frame:IsShown() then
+        pr("delete failed: known locations window is not open")
+        return
+    end
+
+    local previousIndex = ui.selectedIndex
+    local chosen = previousIndex and ui.visibleEntries and ui.visibleEntries[previousIndex] or nil
+    if not chosen then
+        pr("delete failed: no known location selected")
+        return
+    end
+
+    if DeleteKnownLocationEntry(chosen) then
+        RefreshKnownLocationsFrame()
+        RestoreKnownLocationsSelectionAfterDelete(previousIndex)
+        RefreshKnownLocationsFrame()
+    end
+end
+
 local function TryAutoBindCommand(bindingName, desiredKeys, debugName)
     if not (SetBinding and SaveBindings and GetCurrentBindingSet and GetBindingKey and GetBindingAction) then
         return
@@ -3935,6 +3994,19 @@ EnsureKnownLocationsBinding = function()
 
     STATE.knownLocationsBindingInitialized = true
     TryAutoBindCommand("CW_TOGGLE_KNOWN_LOCATIONS", { "SHIFT-G" }, "known locations")
+end
+
+EnsureDeleteSelectedKnownLocationBinding = function()
+    if STATE.deleteSelectedKnownLocationBindingInitialized then
+        return
+    end
+
+    STATE.deleteSelectedKnownLocationBindingInitialized = true
+    TryAutoBindCommand(
+        "CW_DELETE_SELECTED_KNOWN_LOCATION",
+        { "SHIFT-DELETE", "SHIFT-BACKSPACE" },
+        "delete selected known location"
+    )
 end
 
 EnsureSaveHereBinding = function()
@@ -6658,7 +6730,7 @@ local function BuildExpandedRoute()
         return {points = {}, summary = "empty"}
     end
 
-    local current = GetPlayerWorldPos()
+    local current = GetRouteBuildStartPoint()
     if not current then return nil, "no-player-pos" end
 
     local route = {
@@ -7765,6 +7837,7 @@ local function OnEvent(_, event)
         InstallUndoRedoBindings()
         EnsureKnownLocationsBinding()
         EnsureSaveHereBinding()
+        EnsureDeleteSelectedKnownLocationBinding()
         EnsureInterfaceOptionsPanel()
         ScheduleLoginQueueSyncIfNeeded()
         EnsureCarboniteMapButtons()
@@ -7797,19 +7870,28 @@ local function OnEvent(_, event)
         end
     elseif event == "ZONE_CHANGED" or event == "ZONE_CHANGED_NEW_AREA" or event == "ZONE_CHANGED_INDOORS" then
         EnsureDb()
-        if STATE.db and #(STATE.db.destinations or {}) > 0 then
-            InvalidateRoute("zone changed")
-            if STATE.db.autoSyncToCarbonite then
-                SyncQueueToCarbonite()
+
+        local onTaxi = IsPlayerOnTaxi()
+        if onTaxi then
+            STATE.wasOnTaxi = true
+            STATE.pendingTaxiRouteRefresh = true
+            dbg("zone-change autoroute suppressed: player on taxi (" .. tostring(event) .. ")")
+        else
+            if STATE.db and #(STATE.db.destinations or {}) > 0 then
+                InvalidateRoute("zone changed")
+                if STATE.db.autoSyncToCarbonite then
+                    SyncQueueToCarbonite()
+                end
             end
-        end
-        local eventFrom = STATE.lastStablePlayerPos
-        local eventCurrent = GetPlayerWorldPos()
-        if eventCurrent and eventCurrent.instance and eventFrom and eventFrom.instance and STATE.lastNonInstanceStablePlayerPos then
-            eventFrom = STATE.lastNonInstanceStablePlayerPos
-        end
-        if eventFrom then
-            BeginPendingTransport(event, eventFrom)
+
+            local eventFrom = STATE.lastStablePlayerPos
+            local eventCurrent = GetPlayerWorldPos()
+            if eventCurrent and eventCurrent.instance and eventFrom and eventFrom.instance and STATE.lastNonInstanceStablePlayerPos then
+                eventFrom = STATE.lastNonInstanceStablePlayerPos
+            end
+            if eventFrom then
+                BeginPendingTransport(event, eventFrom)
+            end
         end
     elseif event == "PLAYER_DEAD" then
         EnsureDb()
@@ -7838,6 +7920,60 @@ local function OnUpdate(_, elapsed)
     PulseTransportDiscovery(elapsed)
     PulsePendingDeathAutoRoute()
     PulseAutoAdvance()
+
+    local onTaxi = IsPlayerOnTaxi()
+    local current = GetPlayerWorldPos()
+
+    -- === TAXI STATE TRANSITIONS ===
+    if onTaxi then
+        STATE.wasOnTaxi = true
+    elseif STATE.wasOnTaxi then
+        STATE.wasOnTaxi = false
+
+        if STATE.pendingTaxiRouteRefresh then
+            STATE.pendingTaxiRouteRefresh = false
+            EnsureDb()
+
+            if STATE.db and #(STATE.db.destinations or {}) > 0 then
+                InvalidateRoute("taxi ended")
+                if STATE.db.autoSyncToCarbonite then
+                    SyncQueueToCarbonite()
+                end
+            end
+
+            local eventFrom = STATE.lastStablePlayerPos
+            local eventCurrent = current
+
+            if eventCurrent and eventCurrent.instance and eventFrom and eventFrom.instance and STATE.lastNonInstanceStablePlayerPos then
+                eventFrom = STATE.lastNonInstanceStablePlayerPos
+            end
+
+            if eventFrom then
+                BeginPendingTransport("TAXI_ENDED", eventFrom)
+            end
+
+            dbg("taxi ended: deferred zone-change autoroute resumed")
+        end
+    end
+
+    -- === POSITION TRACKING ===
+    if current and (current.maI or (current.wx and current.wy)) then
+        STATE.lastStablePlayerPos = CloneWorldPoint(current)
+
+        -- 🔥 CRITICAL: freeze ground anchor while on taxi
+        if not onTaxi then
+            STATE.lastGroundPlayerPos = CloneWorldPoint(current)
+        end
+
+        if current.instance then
+            STATE.lastInstanceStablePlayerPos = CloneWorldPoint(current)
+            RememberPersistentInstanceContext(current)
+        else
+            STATE.lastNonInstanceStablePlayerPos = CloneWorldPoint(current)
+        end
+    end
+
+    -- === HOOKS (unchanged) ===
     if not STATE.hookInstalled then
         HookMapClicks()
     end

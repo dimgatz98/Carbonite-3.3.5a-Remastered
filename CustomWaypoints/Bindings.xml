@@ -9,4 +9,7 @@
             CustomWaypoints_SaveHere()
         end
     </Binding>
+    <Binding name="CW_DELETE_SELECTED_KNOWN_LOCATION" header="CUSTOMWAYPOINTS">
+        CW_DELETE_SELECTED_KNOWN_LOCATION()
+    </Binding>
 </Bindings>
