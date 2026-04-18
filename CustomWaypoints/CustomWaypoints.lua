@@ -766,7 +766,6 @@ CW.EnsureTaxiDestinationQueueHead = function()
 
     local dest, why = CW.GetActiveTaxiDestination()
     if not dest then
-        dbg("taxi: could not resolve active destination (" .. tostring(why) .. ")")
         return false
     end
 
@@ -862,6 +861,1523 @@ CW.LeaveTaxiMicroRoutingOverride = function()
     dbg("taxi: micro routing restored")
 end
 
+local function Dist(wx1, wy1, wx2, wy2)
+    if wx1 == nil or wy1 == nil or wx2 == nil or wy2 == nil then
+        return nil
+    end
+    local dx = wx1 - wx2
+    local dy = wy1 - wy2
+    return sqrt(dx * dx + dy * dy)
+end
+
+local function WorldToYards(d)
+    if d == nil then
+        return huge
+    end
+    return d * 4.575
+end
+
+local function WalkCostSeconds(wx1, wy1, wx2, wy2)
+    local yardsPerSecond = (STATE.db and STATE.db.walkYardsPerSecond) or 7
+    if yardsPerSecond <= 0 then yardsPerSecond = 7 end
+    local d = Dist(wx1, wy1, wx2, wy2)
+    if not d then
+        return huge
+    end
+    return WorldToYards(d) / yardsPerSecond
+end
+
+local function IsRealTransportType(edgeType)
+    return edgeType and STRAIGHT_EDGE_TYPES[edgeType] or false
+end
+
+local function IsTransitEdgeType(edgeType)
+    return edgeType and TRANSIT_EDGE_TYPES[edgeType] or false
+end
+
+local function InferTransportType(name1, name2)
+    local s = lower((name1 or "") .. " " .. (name2 or ""))
+    if match(s, "flight master") or match(s, "taxi") or match(s, "gryphon") or match(s, "wind rider") then return "flight_master" end
+    if match(s, "zeppelin") then return "zeppelin" end
+    if match(s, "boat") then return "boat" end
+    if match(s, "tram") then return "tram" end
+    if match(s, "portal") then return "portal" end
+    return "transport"
+end
+
+local function InferConnectorEdgeType(coT, name1, name2)
+    if coT == 1 then
+        return "connector"
+    end
+    return InferTransportType(name1, name2)
+end
+
+local function TransportCostSeconds(transportType, wx1, wy1, wx2, wy2)
+    transportType = CanonicalTransportKind(transportType)
+    local travel = WalkCostSeconds(wx1, wy1, wx2, wy2)
+    local base
+    local tuning = GetRoutingTuning()
+
+    if transportType == "portal" then
+        -- Keep portal preference tuning-controlled; when portal bonus is zero,
+        -- avoid a hidden always-cheap portal base.
+        if (tuning.portalBonus or 0) <= 0 then
+            base = 60 + travel * 0.3
+        else
+            base = 25
+        end
+    elseif transportType == "tram" then
+        base = 45 + travel * 0.2
+    elseif transportType == "zeppelin" then
+        base = 75 + travel * 0.2
+    elseif transportType == "boat" then
+        base = 90 + travel * 0.2
+    elseif transportType == "flight_master" then
+        local yards = WorldToYards(Dist(wx1, wy1, wx2, wy2))
+        local speed = tonumber(tuning.flightMasterSpeedYardsPerSecond) or 15
+        if speed < 1 then speed = 1 end
+        base = (tonumber(tuning.flightMasterBoardingSeconds) or 20)
+            + (yards / speed)
+            + (tonumber(tuning.flightMasterLandingSeconds) or 12)
+    else
+        base = 60 + travel * 0.3
+    end
+
+    local adjusted = base - GetTransportPreferenceReductionSeconds(transportType, false)
+
+    if transportType == "portal" then
+        if adjusted < 7 then adjusted = 7 end
+    elseif transportType == "tram" then
+        if adjusted < 18 then adjusted = 18 end
+    elseif transportType == "zeppelin" or transportType == "boat" then
+        if adjusted < 35 then adjusted = 35 end
+    elseif transportType == "flight_master" then
+        if adjusted < 20 then adjusted = 20 end
+    else
+        if adjusted < 10 then adjusted = 10 end
+    end
+
+    return adjusted
+end
+
+local function LearnedTransportKey(edge)
+    return BuildTransportRecordKey(edge)
+end
+
+local function HasLearnedTransportCoords(edge)
+    return edge
+        and edge.fromWx and edge.fromWy
+        and edge.toWx and edge.toWy
+end
+
+-- Keep learned transport DB compact and stable across sessions:
+-- for portal discovery we treat same from-map -> to-map as one learned route.
+local function CompactLearnedTransports()
+    EnsureDb()
+    local learned = STATE.db.learnedTransports
+    if type(learned) ~= "table" or #learned <= 1 then return end
+
+    local merged = {}
+    local byKey = {}
+    for _, edge in ipairs(learned) do
+        NormalizeTransportRecord(edge)
+        local key = LearnedTransportKey(edge)
+        if key and byKey[key] then
+            local dst = byKey[key]
+            -- If existing record is incomplete but a newer duplicate has full
+            -- coordinates, upgrade the stored edge so routing stays usable.
+            if not HasLearnedTransportCoords(dst) and HasLearnedTransportCoords(edge) then
+                dst.fromWx = edge.fromWx
+                dst.fromWy = edge.fromWy
+                dst.fromZx = edge.fromZx
+                dst.fromZy = edge.fromZy
+                dst.toWx = edge.toWx
+                dst.toWy = edge.toWy
+                dst.toZx = edge.toZx
+                dst.toZy = edge.toZy
+                dst.fromMapName = edge.fromMapName or dst.fromMapName
+                dst.toMapName = edge.toMapName or dst.toMapName
+                dst.label = edge.label or dst.label
+            end
+            
+            edge.uses = tonumber(edge.uses) or 1
+            if edge.lastSeen ~= nil then
+                local n = tonumber(edge.lastSeen)
+                if n ~= nil then
+                    edge.lastSeen = n
+                end
+            end
+
+            dst.uses = tonumber(dst.uses) or 1
+            if dst.lastSeen ~= nil then
+                local n = tonumber(dst.lastSeen)
+                if n ~= nil then
+                    dst.lastSeen = n
+                end
+            end
+
+            dst.uses = (tonumber(dst.uses) or 1) + (tonumber(edge.uses) or 1)
+
+            local edgeLastSeenNum = tonumber(edge.lastSeen)
+            local dstLastSeenNum = tonumber(dst.lastSeen)
+
+            if edgeLastSeenNum and (not dstLastSeenNum or edgeLastSeenNum > dstLastSeenNum) then
+                dst.lastSeen = edgeLastSeenNum
+            elseif edge.lastSeen and not dst.lastSeen then
+                dst.lastSeen = edge.lastSeen
+            end
+        else
+            local copy = {}
+            for k, v in pairs(edge) do copy[k] = v end
+            NormalizeTransportRecord(copy)
+            merged[#merged + 1] = copy
+            if key then
+                byKey[key] = copy
+            end
+        end
+    end
+
+    wipe(learned)
+    for i = 1, #merged do
+        learned[i] = merged[i]
+    end
+end
+
+local function EnsureTransportDb()
+    EnsureDb()
+    STATE.db.learnedTransports = STATE.db.learnedTransports or {}
+    CompactLearnedTransports()
+    return STATE.db.learnedTransports
+end
+
+local function TransportLabel(edge)
+    edge = NormalizeTransportRecord(edge)
+    local kind = CanonicalTransportKind(GetEdgeTransportKind(edge))
+    local prefix = "Learned transport"
+    if kind == "portal" then
+        prefix = "Learned Portal"
+    elseif kind == "zeppelin" then
+        prefix = "Zeppelin"
+    elseif kind == "boat" then
+        prefix = "Boat"
+    elseif kind == "tram" then
+        prefix = "Tram"
+    elseif kind == "flight_master" then
+        prefix = "Flight Master"
+    end
+    return tostring(edge.label or (prefix .. ": " .. tostring(edge.fromMapName or edge.fromMaI or "?") .. " -> " .. tostring(edge.toMapName or edge.toMaI or "?")))
+end
+
+local function InjectLearnedTransportEdges(addNode, addEdge, graph)
+    local learned = EnsureTransportDb()
+    if not learned or #learned == 0 then return end
+    for _, edge in ipairs(learned) do
+        if edge.fromMaI and edge.toMaI and edge.fromWx and edge.fromWy and edge.toWx and edge.toWy then
+            local n1 = addNode(edge.fromMaI, edge.fromWx, edge.fromWy, edge.fromMapName or tostring(edge.fromMaI), "transport")
+            local n2 = addNode(edge.toMaI, edge.toWx, edge.toWy, edge.toMapName or tostring(edge.toMaI), "transport")
+            if graph.nodes[n1] then
+                graph.nodes[n1].learnedPortalSource = true
+                graph.nodes[n1].learnedPortalLabel = TransportLabel(edge)
+            end
+            if graph.nodes[n2] then
+                graph.nodes[n2].learnedPortalDest = true
+                graph.nodes[n2].learnedPortalLabel = TransportLabel(edge)
+            end
+            NormalizeTransportRecord(edge)
+            local edgeType = CanonicalTransportKind(edge.transportKind or edge.type or "transport")
+            local hopCost = TransportCostSeconds(edgeType, edge.fromWx, edge.fromWy, edge.toWx, edge.toWy)
+            addEdge(n1, n2, hopCost, edgeType, TransportLabel(edge), IsBidirectionalTransportRecord(edge), { learnedHop = (edgeType == "portal") })
+            graph.links[#graph.links + 1] = { a = n1, b = n2, type = edgeType, learned = true, bidirectional = IsBidirectionalTransportRecord(edge) }
+        end
+    end
+end
+
+-- Known-route hops are intentional user-authored shortcuts. Keep them in the
+-- deep graph with a strongly preferred synthetic hop cost so the pathfinder
+-- will choose a saved route when it actually lines up with the requested trip.
+local function GetKnownRouteHopCostSeconds(loc, a, b)
+    local transportKind = CanonicalTransportKind(InferStoredTransportKind(loc) or "route")
+    if transportKind == "route" then
+        return math.max(6, WalkCostSeconds(a.wx, a.wy, b.wx, b.wy))
+    end
+    return TransportCostSeconds(transportKind, a.wx, a.wy, b.wx, b.wy)
+end
+
+local function InjectKnownRouteEdges(addNode, addEdge, graph)
+    local known = STATE.db and STATE.db.knownLocations or nil
+    if type(known) ~= "table" or #known == 0 then return end
+
+    for _, loc in ipairs(known) do
+        if loc and loc.kind == "route" and type(loc.routePoints) == "table" and #loc.routePoints >= 2 then
+            local routeKind = CanonicalTransportKind(InferStoredTransportKind(loc) or "route")
+            local routeName = tostring(loc.name or loc.label or "Known route")
+            local lastSegmentIndex = #loc.routePoints - 1
+
+            for i = 1, lastSegmentIndex do
+                local a = loc.routePoints[i]
+                local b = loc.routePoints[i + 1]
+
+                if a and b and a.maI and b.maI and a.wx and a.wy and b.wx and b.wy then
+                    local n1 = addNode(a.maI, a.wx, a.wy, a.mapName or tostring(a.maI), "route")
+                    local n2 = addNode(b.maI, b.wx, b.wy, b.mapName or tostring(b.maI), "route")
+
+                    if graph.nodes[n1] then
+                        graph.nodes[n1].knownRoute = true
+                        graph.nodes[n1].knownRouteName = routeName
+                        if i == 1 then
+                            graph.nodes[n1].knownRouteTerminal = true
+                        end
+                    end
+                    if graph.nodes[n2] then
+                        graph.nodes[n2].knownRoute = true
+                        graph.nodes[n2].knownRouteName = routeName
+                        if i == lastSegmentIndex then
+                            graph.nodes[n2].knownRouteTerminal = true
+                        end
+                    end
+
+                    local isBidirectional = (loc.bidirectional == true) or routeKind == "flight_master"
+                    addEdge(n1, n2, GetKnownRouteHopCostSeconds(loc, a, b), routeKind, "Known route: " .. routeName, isBidirectional, {
+                        routeTransportKind = routeKind,
+                    })
+                    graph.links[#graph.links + 1] = { a = n1, b = n2, type = routeKind, knownRoute = true, bidirectional = isBidirectional }
+                end
+            end
+        end
+    end
+end
+
+local function ConnectorCostSeconds(edgeType, wx1, wy1, wx2, wy2)
+    if edgeType == "connector" then
+        return WalkCostSeconds(wx1, wy1, wx2, wy2)
+    end
+    return TransportCostSeconds(edgeType, wx1, wy1, wx2, wy2)
+end
+
+local function BuildKnownTaxiLookup()
+    local out = {}
+
+    if NxCData and type(NxCData["Taxi"]) == "table" then
+        for taxiName, known in pairs(NxCData["Taxi"]) do
+            if known then
+                for key in pairs(CW.BuildTaxiKeyVariants(taxiName)) do
+                    out[key] = taxiName
+                end
+            end
+        end
+    end
+
+    if type(STATE.sessionKnownTaxis) == "table" then
+        for key, taxiName in pairs(STATE.sessionKnownTaxis) do
+            if key and taxiName and out[key] == nil then
+                out[key] = taxiName
+            end
+        end
+    end
+
+    return out
+end
+
+local function NormalizeTaxiKey(name)
+    if not name then return nil end
+    name = tostring(name)
+    name = gsub(name, "^%s+", "")
+    name = gsub(name, "%s+$", "")
+    name = gsub(name, "[%(%)]", " ")
+    name = gsub(name, "[,:%-%./']", " ")
+    name = gsub(name, "%s+", " ")
+    name = gsub(name, "^%s+", "")
+    name = gsub(name, "%s+$", "")
+    return lower(name)
+end
+
+local function BuildKnownTaxiNodes(map)
+    if not (STATE.db and STATE.db.useFlightMasters) then return {} end
+    if STATE.db and IsTransitSimplifiedEffective() then return {} end
+    if not Nx or not Nx.Tra then
+        return {}
+    end
+
+    local knownLookup = BuildKnownTaxiLookup()
+    if not next(knownLookup) then
+        return {}
+    end
+
+    local out = {}
+    local seen = {}
+    local rawCandidates = {}
+
+    local function FindKnownTaxiName(nameA, nameB)
+        for key in pairs(CW.BuildTaxiKeyVariants(nameA)) do
+            if knownLookup[key] then
+                return knownLookup[key], key
+            end
+        end
+        for key in pairs(CW.BuildTaxiKeyVariants(nameB)) do
+            if knownLookup[key] then
+                return knownLookup[key], key
+            end
+        end
+        return nil, nil
+    end
+
+    local function pushTaxiAny(taxiName, npcName, maI, wx, wy, knownTaxiName)
+        local canonicalName = knownTaxiName or taxiName
+        local canonicalKey = NormalizeTaxiKey(canonicalName)
+        if not canonicalKey or seen[canonicalKey] then return end
+        if not (maI and wx and wy) then return end
+
+        local ok, zx, zy = pcall(map.GZP, map, maI, wx, wy)
+        if not (ok and zx and zy and zx >= 0 and zx <= 100 and zy >= 0 and zy <= 100) then return end
+
+        seen[canonicalKey] = true
+        out[#out + 1] = {
+            taxiName = canonicalName,
+            npcName = npcName or canonicalName,
+            maI = maI,
+            wx = wx,
+            wy = wy,
+            zx = zx,
+            zy = zy,
+        }
+    end
+
+    if type(Nx.Tra.Tra) == "table" then
+        for _, list in pairs(Nx.Tra.Tra) do
+            if type(list) == "table" then
+                for _, nod in ipairs(list) do
+                    if type(nod) == "table" and nod.LoN and nod.MaI and nod.WX and nod.WY then
+                        rawCandidates[#rawCandidates + 1] = {
+                            taxiName = nod.LoN,
+                            npcName = nod.Nam or nod.LoN,
+                            maI = nod.MaI,
+                            wx = nod.WX,
+                            wy = nod.WY,
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    for _, cand in ipairs(rawCandidates) do
+        local knownTaxiName = FindKnownTaxiName(cand.taxiName, cand.npcName)
+        if knownTaxiName then
+            pushTaxiAny(cand.taxiName, cand.npcName, cand.maI, cand.wx, cand.wy, knownTaxiName)
+        end
+    end
+
+    if Nx.Map and Nx.Map.Gui and type(Nx.Map.Gui.FiT2) == "function" then
+        for _, knownTaxiName in pairs(knownLookup) do
+            local canonicalKey = NormalizeTaxiKey(knownTaxiName)
+            if canonicalKey and not seen[canonicalKey] then
+                local npcName, wx, wy = Nx.Map.Gui:FiT2(knownTaxiName)
+                if wx and wy then
+                    local bestMapId, bestDist2 = nil, nil
+
+                    for _, cand in ipairs(rawCandidates) do
+                        local matchedName = FindKnownTaxiName(cand.taxiName, cand.npcName)
+                        if matchedName == knownTaxiName and cand.maI then
+                            local ok, zx, zy = pcall(map.GZP, map, cand.maI, wx, wy)
+                            if ok and zx and zy and zx >= 0 and zx <= 100 and zy >= 0 and zy <= 100 then
+                                local dx = zx - 50
+                                local dy = zy - 50
+                                local dist2 = dx * dx + dy * dy
+                                if not bestDist2 or dist2 < bestDist2 then
+                                    bestMapId, bestDist2 = cand.maI, dist2
+                                end
+                            end
+                        end
+                    end
+
+                    if not bestMapId then
+                        for maI = 1, 5000 do
+                            local ok, zx, zy = pcall(map.GZP, map, maI, wx, wy)
+                            if ok and zx and zy and zx >= 0 and zx <= 100 and zy >= 0 and zy <= 100 then
+                                local dx = zx - 50
+                                local dy = zy - 50
+                                local dist2 = dx * dx + dy * dy
+                                if not bestDist2 or dist2 < bestDist2 then
+                                    bestMapId, bestDist2 = maI, dist2
+                                end
+                            end
+                        end
+                    end
+
+                    if bestMapId then
+                        pushTaxiAny(knownTaxiName, npcName or knownTaxiName, bestMapId, wx, wy, knownTaxiName)
+                    end
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+-- Same as origin/master: h=0 => uniform-cost search (optimal for non-negative edge weights).
+local function HeuristicCost()
+    return 0
+end
+
+local function FindPathAStar(nodes, startId, goalId)
+    local open = {[startId] = true}
+    local openList = {startId}
+    local came = {}
+    local cameEdge = {}
+    local gScore = {[startId] = 0}
+    local fScore = {[startId] = HeuristicCost(nodes[startId], nodes[goalId])}
+    local explored = 0
+
+    while #openList > 0 do
+        local bestIndex, current, bestF = 1, openList[1], fScore[openList[1]] or huge
+        for i = 2, #openList do
+            local nid = openList[i]
+            local f = fScore[nid] or huge
+            if f < bestF then
+                bestIndex, current, bestF = i, nid, f
+            end
+        end
+
+        tremove(openList, bestIndex)
+        open[current] = nil
+        explored = explored + 1
+
+        if current == goalId then
+            local path = {current}
+            while came[current] do
+                current = came[current]
+                tinsert(path, 1, current)
+            end
+            return path, cameEdge, gScore[goalId] or 0, explored
+        end
+
+        local node = nodes[current]
+        if node and node.edges then
+            for _, edge in ipairs(node.edges) do
+                local tentative = (gScore[current] or huge) + (edge.cost or huge)
+                if tentative < (gScore[edge.to] or huge) then
+                    came[edge.to] = current
+                    cameEdge[edge.to] = edge
+                    gScore[edge.to] = tentative
+                    fScore[edge.to] = tentative + HeuristicCost(nodes[edge.to], nodes[goalId])
+                    if not open[edge.to] then
+                        open[edge.to] = true
+                        tinsert(openList, edge.to)
+                    end
+                end
+            end
+        end
+    end
+
+    return nil, nil, nil, explored
+end
+
+local function EnsureGraph()
+    if STATE.graph then return STATE.graph end
+
+    local map = GetMap()
+    if not map or not Nx or not Nx.ZoC then
+        return nil, "carbonite-data-not-ready"
+    end
+
+    local graph = {
+        nodes = {},
+        links = {},
+        nodeCount = 0,
+        edgeCount = 0,
+    }
+
+    local nodeIndex = {}
+
+    local function makeNodeKey(maI, wx, wy, nodeType, label)
+        return table.concat({ tostring(maI or "?"), format("%.3f", wx or 0), format("%.3f", wy or 0), tostring(nodeType or "?"), tostring(label or "") }, "|")
+    end
+
+    local function addNode(maI, wx, wy, label, nodeType)
+        local key = makeNodeKey(maI, wx, wy, nodeType, label)
+        if nodeIndex[key] then
+            return nodeIndex[key]
+        end
+
+        graph.nodeCount = graph.nodeCount + 1
+        local id = graph.nodeCount
+        graph.nodes[id] = {
+            id = id,
+            maI = maI,
+            wx = wx,
+            wy = wy,
+            label = label,
+            type = nodeType,
+            continent = nil,
+            edges = {},
+        }
+        nodeIndex[key] = id
+        return id
+    end
+
+    local function addEdge(a, b, cost, edgeType, label, bidirectional, opts)
+        opts = opts or {}
+        if not graph.nodes[a] or not graph.nodes[b] then return end
+        tinsert(graph.nodes[a].edges, {
+            to = b,
+            cost = cost,
+            type = edgeType,
+            label = label,
+            learnedHop = opts.learnedHop,
+            routeTransportKind = opts.routeTransportKind,
+        })
+        graph.edgeCount = graph.edgeCount + 1
+        if bidirectional then
+            tinsert(graph.nodes[b].edges, {
+                to = a,
+                cost = cost,
+                type = edgeType,
+                label = label,
+                learnedHop = opts.learnedHop,
+                routeTransportKind = opts.routeTransportKind,
+            })
+            graph.edgeCount = graph.edgeCount + 1
+        end
+    end
+
+    local function addPassageEdgesFromMWI()
+        if not map.MWI then return end
+        for maI, win1 in pairs(map.MWI) do
+            if type(win1) == "table" and type(win1.Con1) == "table" then
+                for destMaI, zco1 in pairs(win1.Con1) do
+                    if type(zco1) == "table" then
+                        for _, con in ipairs(zco1) do
+                            if type(con) == "table" and con.StX and con.StY and con.EnX and con.EnY then
+                                local fromName = map.ITN and map:ITN(con.SMI or maI) or tostring(con.SMI or maI)
+                                local toName = map.ITN and map:ITN(con.EMI1 or destMaI) or tostring(con.EMI1 or destMaI)
+                                local n1 = addNode(con.SMI or maI, con.StX, con.StY, fromName, "connector")
+                                local n2 = addNode(con.EMI1 or destMaI, con.EnX, con.EnY, toName, "connector")
+                                addEdge(n1, n2, con.Dis or WalkCostSeconds(con.StX, con.StY, con.EnX, con.EnY), "connector", format("Passage: %s -> %s", tostring(fromName), tostring(toName)), true)
+                                graph.links[#graph.links + 1] = { a = n1, b = n2, type = "connector" }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    addPassageEdgesFromMWI()
+
+    for _, str in ipairs(Nx.ZoC) do
+        local fla, coT, mI1, x1, y1, mI2, x2, y2, na11, na21 = map:CoU(str)
+        if mI1 and mI2 and x1 and y1 and x2 and y2 and x1 ~= 0 and y1 ~= 0 and x2 ~= 0 and y2 ~= 0 then
+            local wx1, wy1 = map:GWP(mI1, x1, y1)
+            local wx2, wy2 = map:GWP(mI2, x2, y2)
+            local edgeType = InferConnectorEdgeType(coT, na11, na21)
+            local fromName = (na11 and na11 ~= "") and na11 or (map.ITN and map:ITN(mI1) or tostring(mI1))
+            local toName = (na21 and na21 ~= "") and na21 or (map.ITN and map:ITN(mI2) or tostring(mI2))
+            local n1 = addNode(mI1, wx1, wy1, fromName, edgeType == "connector" and "connector" or "transport")
+            local n2 = addNode(mI2, wx2, wy2, toName, edgeType == "connector" and "connector" or "transport")
+            local bidi = band(fla or 0, 1) == 1
+            local edgeLabel
+            if edgeType == "connector" then
+                edgeLabel = format("Walk connection: %s -> %s", tostring(map.ITN and map:ITN(mI1) or mI1), tostring(map.ITN and map:ITN(mI2) or mI2))
+            else
+                edgeLabel = (edgeType:gsub("^%l", string.upper)) .. ": " .. tostring(map.ITN and map:ITN(mI1) or mI1) .. " -> " .. tostring(map.ITN and map:ITN(mI2) or mI2)
+            end
+            addEdge(n1, n2, ConnectorCostSeconds(edgeType, wx1, wy1, wx2, wy2), edgeType, edgeLabel, bidi)
+            graph.links[#graph.links + 1] = {a = n1, b = n2, type = edgeType}
+        end
+    end
+
+    InjectLearnedTransportEdges(addNode, addEdge, graph)
+    InjectKnownRouteEdges(addNode, addEdge, graph)
+
+    local taxiNodes = BuildKnownTaxiNodes(map)
+    local taxiNodeIds = {}
+    if #taxiNodes > 0 and Nx and Nx.Tra and type(Nx.Tra.TFCT) == "function" then
+        for _, taxi in ipairs(taxiNodes) do
+            local nodeId = addNode(taxi.maI, taxi.wx, taxi.wy, taxi.taxiName, "transport")
+            taxiNodeIds[#taxiNodeIds + 1] = { id = nodeId, taxiName = taxi.taxiName, npcName = taxi.npcName, maI = taxi.maI, wx = taxi.wx, wy = taxi.wy }
+        end
+
+        for i = 1, #taxiNodeIds do
+            local a = taxiNodeIds[i]
+            for j = i + 1, #taxiNodeIds do
+                local b = taxiNodeIds[j]
+                local ok, directCost = pcall(Nx.Tra.TFCT, Nx.Tra, a.taxiName, b.taxiName)
+                if ok and directCost and directCost > 0 then
+                    addEdge(a.id, b.id, TransportCostSeconds("flight_master", a.wx, a.wy, b.wx, b.wy), "flight_master", format("Flight Master: %s -> %s", tostring(a.taxiName), tostring(b.taxiName)), true)
+                    graph.links[#graph.links + 1] = {a = a.id, b = b.id, type = "flight_master"}
+                end
+            end
+        end
+
+        for _, tinfo in ipairs(taxiNodeIds) do
+            local gn = graph.nodes[tinfo.id]
+            if gn then
+                gn.taxiHub = true
+            end
+        end
+    end
+
+    local walkRadius = 320
+    local walkNeighbors = 4
+    local forcedWalkPenalty = 900
+    local function IsTravelNodeType(t)
+        return t == "connector" or t == "transport" or t == "route"
+    end
+    for i = 1, graph.nodeCount do
+        local ni = graph.nodes[i]
+        local sameMap = {}
+        for j = 1, graph.nodeCount do
+            if i ~= j then
+                local nj = graph.nodes[j]
+                if ni.maI == nj.maI then
+                    local baseCost = WalkCostSeconds(ni.wx, ni.wy, nj.wx, nj.wy)
+                    if baseCost <= walkRadius then
+                        sameMap[#sameMap + 1] = { id = j, cost = math.max(1, baseCost), forced = false }
+                    elseif IsTravelNodeType(ni.type) and IsTravelNodeType(nj.type) then
+                        sameMap[#sameMap + 1] = { id = j, cost = baseCost + forcedWalkPenalty, forced = true }
+                    end
+                end
+            end
+        end
+        table.sort(sameMap, function(a, b)
+            return a.cost < b.cost
+        end)
+        local added = 0
+        local forcedAdded = 0
+        for _, cand in ipairs(sameMap) do
+            if not cand.forced then
+                if added < walkNeighbors then
+                    addEdge(i, cand.id, cand.cost, "walk", "walk", false)
+                    added = added + 1
+                end
+            elseif added == 0 and forcedAdded < 1 then
+                addEdge(i, cand.id, cand.cost, "walk", "walk-penalized", false)
+                forcedAdded = forcedAdded + 1
+            end
+        end
+    end
+
+    local function linkLearnedPortalSourcesToNearbyCarbonitePortals()
+        local function hasWalkEdge(fromId, toId)
+            for _, e in ipairs(graph.nodes[fromId].edges or {}) do
+                if e.to == toId and e.type == "walk" then
+                    return true
+                end
+            end
+            return false
+        end
+        local maxWalkSec = 680
+        for i = 1, graph.nodeCount do
+            local n = graph.nodes[i]
+            if n and n.learnedPortalSource then
+                for j = 1, graph.nodeCount do
+                    if i ~= j then
+                        local m = graph.nodes[j]
+                        if m and m.maI == n.maI and m.type == "transport" and not m.learnedPortalSource then
+                            local hasPortal = false
+                            for _, e in ipairs(m.edges or {}) do
+                                if e.type == "portal" then
+                                    hasPortal = true
+                                    break
+                                end
+                            end
+                            if hasPortal then
+                                local sec = WalkCostSeconds(n.wx, n.wy, m.wx, m.wy)
+                                if sec <= maxWalkSec then
+                                    local c = math.max(1, sec)
+                                    if not hasWalkEdge(i, j) then
+                                        addEdge(i, j, c, "walk", "walk", false)
+                                    end
+                                    if not hasWalkEdge(j, i) then
+                                        addEdge(j, i, c, "walk", "walk", false)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    linkLearnedPortalSourcesToNearbyCarbonitePortals()
+
+    STATE.graph = graph
+    return graph
+end
+
+-- Compare plain start->goal A* with "walk to learned source on start map + learned portal + tail":
+-- guarantees /cw transports is chosen when total time is lower (Dijkstra alone can still prefer tram first hop).
+local function FindBestPathWithOptionalLearnedPrefix(nodes, startId, goalId, startPoint, baseCount)
+    local path0, ce0, cost0, ex0 = FindPathAStar(nodes, startId, goalId)
+    if not path0 then
+        return nil, nil, nil, ex0 or 0
+    end
+    local tuning = GetRoutingTuning()
+    if (tuning.portalBonus or 0) <= 0 and (tuning.learnedPortalBonus or 0) <= 0 then
+        return path0, ce0, cost0, ex0
+    end
+    local bestPath, bestCame, bestCost, bestEx = path0, ce0, cost0, ex0
+    local sx, sy = nodes[startId].wx, nodes[startId].wy
+
+    for nid = 1, baseCount do
+        local nn = nodes[nid]
+        if nn and nn.learnedPortalSource and nn.maI == startPoint.maI then
+            local w0 = WalkCostSeconds(sx, sy, nn.wx, nn.wy)
+            for _, ed in ipairs(nn.edges or {}) do
+                if ed.learnedHop then
+                    local p2, ce2, c2, ex2 = FindPathAStar(nodes, ed.to, goalId)
+                    if p2 and c2 then
+                        local total = w0 + (ed.cost or huge) + c2
+                        if total < bestCost then
+                            bestCost = total
+                            bestEx = (ex0 or 0) + (ex2 or 0)
+                            local merged = { startId, nid }
+                            for k = 1, #p2 do
+                                merged[#merged + 1] = p2[k]
+                            end
+                            local mce = {}
+                            mce[nid] = {
+                                to = nid,
+                                cost = w0,
+                                type = "walk",
+                                label = "walk-to-node",
+                            }
+                            mce[ed.to] = ed
+                            for k = 2, #p2 do
+                                local vx = p2[k]
+                                if ce2[vx] then
+                                    mce[vx] = ce2[vx]
+                                end
+                            end
+                            bestPath = merged
+                            bestCame = mce
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPath, bestCame, bestCost, bestEx
+end
+
+local function CollapseDeepTaxiChains(points)
+    if type(points) ~= "table" or #points <= 2 then
+        return points
+    end
+
+    local out = {}
+    local i = 1
+
+    local function ClonePoint(pt)
+        local copy = {}
+        for k, v in pairs(pt or {}) do
+            copy[k] = v
+        end
+        return copy
+    end
+
+    local function IsFlightMasterRoutePoint(pt)
+        if not pt then return false end
+        local kind = CanonicalTransportKind(pt.transportKind or pt.edgeType)
+        return kind == "flight_master"
+    end
+
+    local function IsMinorFlightMasterConnector(pt)
+        if not pt then return false end
+        if pt.edgeType ~= "walk-to-transport" then return false end
+        local cost = tonumber(pt.cost) or huge
+        return cost <= 3
+    end
+
+    while i <= #points do
+        local pt = points[i]
+
+        if IsFlightMasterRoutePoint(pt) then
+            local chainStart = i
+            local chainEnd = i
+            local totalTaxiCost = tonumber(pt.cost) or 0
+            local lastFlightIndex = i
+
+            while chainEnd < #points do
+                local nextPt = points[chainEnd + 1]
+                if IsFlightMasterRoutePoint(nextPt) then
+                    chainEnd = chainEnd + 1
+                    lastFlightIndex = chainEnd
+                    totalTaxiCost = totalTaxiCost + (tonumber(nextPt.cost) or 0)
+                elseif IsMinorFlightMasterConnector(nextPt) and chainEnd + 2 <= #points and IsFlightMasterRoutePoint(points[chainEnd + 2]) then
+                    chainEnd = chainEnd + 1
+                    totalTaxiCost = totalTaxiCost + (tonumber(nextPt.cost) or 0)
+                else
+                    break
+                end
+            end
+
+            if lastFlightIndex > chainStart then
+                local firstTaxiPoint = points[chainStart]
+                local lastTaxiPoint = points[lastFlightIndex]
+                local collapsed = ClonePoint(lastTaxiPoint)
+
+                collapsed.edgeType = "flight_master"
+                collapsed.transportKind = "flight_master"
+                collapsed.cost = totalTaxiCost
+                collapsed.transportChainStart = chainStart
+                collapsed.transportChainEnd = lastFlightIndex
+                collapsed.collapsedMinorConnector = true
+
+                local fromName = firstTaxiPoint.label or firstTaxiPoint.mapName or tostring(firstTaxiPoint.maI or "?")
+                local toName = lastTaxiPoint.label or lastTaxiPoint.mapName or tostring(lastTaxiPoint.maI or "?")
+                collapsed.label = "Flight Master: " .. tostring(fromName) .. " -> " .. tostring(toName)
+
+                out[#out + 1] = collapsed
+                i = chainEnd + 1
+            else
+                local single = ClonePoint(pt)
+                single.edgeType = "flight_master"
+                single.transportKind = "flight_master"
+                out[#out + 1] = single
+                i = i + 1
+            end
+        else
+            out[#out + 1] = ClonePoint(pt)
+            i = i + 1
+        end
+    end
+
+    return out
+end
+
+local function BuildTransportLeg(startPoint, destPoint)
+    local baseGraph, why = EnsureGraph()
+    if not baseGraph then
+        return nil, "graph-unavailable:" .. tostring(why)
+    end
+
+    local nodes = {}
+    local baseCount = baseGraph.nodeCount or 0
+    for id = 1, baseCount do
+        local n = baseGraph.nodes[id]
+        if n then
+            local copyEdges = {}
+            for _, e in ipairs(n.edges) do
+                copyEdges[#copyEdges + 1] = {
+                    to = e.to,
+                    cost = e.cost,
+                    type = e.type,
+                    label = e.label,
+                    learnedHop = e.learnedHop,
+                    routeTransportKind = e.routeTransportKind,
+                }
+            end
+            nodes[id] = {
+                id = n.id,
+                maI = n.maI,
+                wx = n.wx,
+                wy = n.wy,
+                label = n.label,
+                type = n.type,
+                continent = n.continent,
+                edges = copyEdges,
+                learnedPortalSource = n.learnedPortalSource and true or false,
+                learnedPortalDest = n.learnedPortalDest and true or false,
+                learnedPortalLabel = n.learnedPortalLabel,
+                                taxiHub = n.taxiHub and true or false,
+                knownRoute = n.knownRoute and true or false,
+                                knownRouteName = n.knownRouteName,
+                knownRouteTerminal = n.knownRouteTerminal and true or false,
+            }
+        end
+    end
+
+    local nextId = baseCount
+
+    local function addQueryNode(pt, nodeType, label)
+        nextId = nextId + 1
+        nodes[nextId] = {
+            id = nextId,
+            maI = pt.maI,
+            wx = pt.wx,
+            wy = pt.wy,
+            label = label,
+            type = nodeType,
+            edges = {},
+        }
+        return nextId
+    end
+
+    local function connectBidirectional(a, b, cost, edgeType, label)
+        tinsert(nodes[a].edges, {to = b, cost = cost, type = edgeType, label = label})
+        tinsert(nodes[b].edges, {to = a, cost = cost, type = edgeType, label = label})
+    end
+
+       local function attachQueryNode(queryId, preferMapId, preferContinent, outwardLabel)
+        local isStart = outwardLabel == "walk-to-node"
+        local isGoal = outwardLabel == "node-to-goal"
+        local tuning = GetRoutingTuning()
+
+        local function countPortalTaxi(node)
+            local pe, te = 0, 0
+            if node and node.edges then
+                for _, e in ipairs(node.edges) do
+                    if e.type == "portal" then
+                        pe = pe + 1
+                    elseif e.type == "taxi" then
+                        te = te + 1
+                    end
+                end
+            end
+            return pe, te
+        end
+
+        local sameMap = {}
+        for id, n in pairs(nodes) do
+            if type(id) == "number"
+                and id ~= queryId
+                and n.maI == preferMapId
+                and n.type ~= "start"
+                and n.type ~= "goal" then
+
+                local raw = WalkCostSeconds(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy)
+                local yards = WorldToYards(Dist(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy))
+                local pe, te = countPortalTaxi(n)
+
+                local candidate = {
+                    id = id,
+                    rawCost = raw,
+                    yards = yards,
+                    learnedS = n.learnedPortalSource and true or false,
+                    learnedD = n.learnedPortalDest and true or false,
+                    taxiHub = n.taxiHub and true or false,
+                    knownRoute = n.knownRoute and true or false,
+                    knownRouteName = n.knownRouteName,
+                    knownRouteTerminal = n.knownRouteTerminal and true or false,
+                    portalEdges = pe,
+                    taxiEdges = te,
+                }
+                candidate.score = GetAttachCandidateScoreSeconds(raw, candidate, isStart, isGoal)
+                sameMap[#sameMap + 1] = candidate
+            end
+        end
+
+        -- If there are no nodes on the exact map (common for destination maps),
+        -- fall back to same-continent candidates so portal/taxi legs can still connect.
+        if #sameMap == 0 and preferContinent then
+            for id, n in pairs(nodes) do
+                if type(id) == "number"
+                    and id ~= queryId
+                    and n.continent == preferContinent
+                    and n.type ~= "start"
+                    and n.type ~= "goal" then
+
+                    local raw = WalkCostSeconds(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy)
+                    local yards = WorldToYards(Dist(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy))
+                    local pe, te = countPortalTaxi(n)
+                    local candidate = {
+                    id = id,
+                    rawCost = raw,
+                    yards = yards,
+                    learnedS = n.learnedPortalSource and true or false,
+                    learnedD = n.learnedPortalDest and true or false,
+                    taxiHub = n.taxiHub and true or false,
+                    knownRoute = n.knownRoute and true or false,
+                    knownRouteName = n.knownRouteName,
+                    knownRouteTerminal = n.knownRouteTerminal and true or false,
+                    portalEdges = pe,
+                    taxiEdges = te,
+                }
+                candidate.score = GetAttachCandidateScoreSeconds(raw, candidate, isStart, isGoal)
+                sameMap[#sameMap + 1] = candidate
+                end
+            end
+        end
+
+        table.sort(sameMap, function(a, b)
+            if a.score ~= b.score then return a.score < b.score end
+            return a.rawCost < b.rawCost
+        end)
+
+        local limit = 16
+        local attached = 0
+        local used = {}
+
+        -- Critical invariant:
+        -- query-node attachment must stay cost-driven. Hard walk-distance
+        -- gates can hide valid portal/taxi routes from the pathfinder and
+        -- force cross-continent fallback even when a faster transport path
+        -- exists. We still cap the number of local attachments for graph
+        -- size, but candidate eligibility is determined by score/cost only.
+        for _, c in ipairs(sameMap) do
+            if attached >= limit then break end
+
+            if c.rawCost <= 2200 and not used[c.id] then
+                connectBidirectional(queryId, c.id, c.rawCost, "walk", outwardLabel)
+                used[c.id] = true
+                attached = attached + 1
+            end
+        end
+
+        if attached == 0 then
+            table.sort(sameMap, function(a, b)
+                return a.rawCost < b.rawCost
+            end)
+            for i = 1, math.min(12, #sameMap) do
+                local c = sameMap[i]
+                if c and not used[c.id] then
+                    connectBidirectional(queryId, c.id, c.rawCost, "walk", outwardLabel)
+                    used[c.id] = true
+                    attached = attached + 1
+                end
+            end
+        end
+
+        return attached
+    end
+
+    local startId = addQueryNode(startPoint, "start", "start")
+    local goalId = addQueryNode(destPoint, "goal", "goal")
+
+    attachQueryNode(startId, startPoint.maI, nodes[startId].continent, "walk-to-node")
+    attachQueryNode(goalId, destPoint.maI, nodes[goalId].continent, "node-to-goal")
+
+    local path, cameEdge, totalCost, explored = FindBestPathWithOptionalLearnedPrefix(nodes, startId, goalId, startPoint, baseCount)
+    if not path then
+        return nil, format("no-path explored=%d", explored or -1)
+    end
+
+    local route = {
+        totalCost = totalCost,
+        explored = explored,
+        transportUsed = false,
+        points = {},
+    }
+
+    local map = GetMap()
+    for idx = 1, #path do
+        local nodeId = path[idx]
+        local n = nodes[nodeId]
+        local edge = idx > 1 and cameEdge[nodeId] or nil
+        if edge and IsRealTransportType(edge.type) then
+            route.transportUsed = true
+        end
+        local zx, zy = map:GZP(n.maI, n.wx, n.wy)
+        tinsert(route.points, {
+            maI = n.maI,
+            wx = n.wx,
+            wy = n.wy,
+            zx = zx,
+            zy = zy,
+            mapName = map.ITN and map:ITN(n.maI) or ("Map " .. tostring(n.maI)),
+            edgeType = edge and edge.type or "start",
+            transportKind = edge and (edge.routeTransportKind or edge.type) or nil,
+            label = edge and edge.label or n.label or n.type,
+            cost = edge and edge.cost or 0,
+        })
+    end
+
+    if STATE.db and STATE.db.simplifyTransitWaypoints then
+        route.points = CollapseMinimalTransitNoise(CollapseDeepTaxiChains(route.points))
+    else
+        route.points = CollapseDeepTaxiChains(route.points)
+    end
+
+    return route
+end
+
+local function BuildDirectFallbackLeg(startPoint, destPoint, why, crossContinent)
+    local directCost = WalkCostSeconds(startPoint.wx, startPoint.wy, destPoint.wx, destPoint.wy)
+    dbg("using explicit fallback target: " .. tostring(why))
+    return {
+        totalCost = directCost,
+        explored = 1,
+        fallbackDirect = true,
+        points = {
+            {
+                maI = startPoint.maI,
+                wx = startPoint.wx,
+                wy = startPoint.wy,
+                zx = startPoint.zx,
+                zy = startPoint.zy,
+                mapName = startPoint.mapName,
+                edgeType = "start",
+                label = "Start",
+                cost = 0,
+            },
+            {
+                maI = destPoint.maI,
+                wx = destPoint.wx,
+                wy = destPoint.wy,
+                zx = destPoint.zx,
+                zy = destPoint.zy,
+                mapName = destPoint.mapName,
+                edgeType = crossContinent and "fallback" or "walk",
+                label = crossContinent and "Cross-continent fallback" or "Direct destination",
+                cost = directCost,
+                forceStraight = true,
+            }
+        },
+    }
+end
+
+local function BuildRouteLeg(startPoint, destPoint)
+    if not startPoint or not destPoint then
+        return nil, "missing-leg-endpoint"
+    end
+
+    local map = GetMap()
+    if not map then return nil, "no-map" end
+
+    local directCost = WalkCostSeconds(startPoint.wx, startPoint.wy, destPoint.wx, destPoint.wy)
+    if IsPlayerOnTaxi() and destPoint and destPoint.cwTaxiInjected then
+        local directTaxiCost = WalkCostSeconds(startPoint.wx, startPoint.wy, destPoint.wx, destPoint.wy)
+        return {
+            totalCost = directTaxiCost,
+            explored = 1,
+            fallbackDirect = true,
+            activeTaxiLeg = true,
+            points = {
+                {
+                    maI = startPoint.maI,
+                    wx = startPoint.wx,
+                    wy = startPoint.wy,
+                    zx = startPoint.zx,
+                    zy = startPoint.zy,
+                    mapName = startPoint.mapName,
+                    edgeType = "start",
+                    label = "Start",
+                    cost = 0,
+                },
+                {
+                    maI = destPoint.maI,
+                    wx = destPoint.wx,
+                    wy = destPoint.wy,
+                    zx = destPoint.zx,
+                    zy = destPoint.zy,
+                    mapName = destPoint.mapName,
+                    edgeType = "flight_master",
+                    transportKind = "flight_master",
+                    label = destPoint.userName or destPoint.mapName or "Taxi destination",
+                    cost = directTaxiCost,
+                    forceStraight = true,
+                }
+            },
+        }
+    end
+
+    local directLeg = {
+        totalCost = directCost,
+        explored = 1,
+        fallbackDirect = startPoint.maI ~= destPoint.maI,
+        points = {
+            {
+                maI = startPoint.maI,
+                wx = startPoint.wx,
+                wy = startPoint.wy,
+                zx = startPoint.zx,
+                zy = startPoint.zy,
+                mapName = startPoint.mapName,
+                edgeType = "start",
+                label = "Start",
+                cost = 0,
+            },
+            {
+                maI = destPoint.maI,
+                wx = destPoint.wx,
+                wy = destPoint.wy,
+                zx = destPoint.zx,
+                zy = destPoint.zy,
+                mapName = destPoint.mapName,
+                edgeType = "walk",
+                label = startPoint.maI ~= destPoint.maI and "Direct destination" or "Walk",
+                cost = directCost,
+                forceStraight = startPoint.maI ~= destPoint.maI,
+            }
+        },
+    }
+
+    if STATE.db and STATE.db.useIntercontinentalRouting then
+        local route, why = BuildTransportLeg(startPoint, destPoint)
+        if route then
+            -- Same-map legs must still be allowed to use FM/transport when cheaper.
+            if startPoint.maI == destPoint.maI then
+                local routeCost = tonumber(route.totalCost) or huge
+                if route.transportUsed and routeCost <= directCost + 10 then
+                    return route
+                end
+                return directLeg
+            end
+
+            return route
+        end
+
+        local startCont = startPoint.continent or nil
+        local destCont = destPoint.continent or nil
+        local crossContinent = startCont and destCont and startCont ~= destCont
+
+        if crossContinent then
+            return BuildDirectFallbackLeg(startPoint, destPoint, why, true)
+        end
+
+        local forcedSouthKalimdor = BuildSouthKalimdorFallbackLeg(startPoint, destPoint, why)
+        if forcedSouthKalimdor then
+            return forcedSouthKalimdor
+        end
+
+        if STATE.db and not STATE.db.simplifyTransitWaypoints then
+            dbg("deep graph fallback to direct destination: " .. tostring(why))
+        else
+            dbg("graph leg fallback to direct walk: " .. tostring(why))
+        end
+    end
+
+    return directLeg
+end
+
+local function BuildExpandedRoute()
+    local map = GetMap()
+    if not map then return nil, "no-map" end
+
+    if #STATE.db.destinations == 0 then
+        STATE.expandedRoute = nil
+        return {points = {}, summary = "empty"}
+    end
+
+    local current = GetRouteBuildStartPoint()
+    if not current then return nil, "no-player-pos" end
+
+    local route = {
+        totalCost = 0,
+        explored = 0,
+        points = {},
+    }
+
+    for q = 1, #STATE.db.destinations do
+        local dest = STATE.db.destinations[q]
+        local leg, why = BuildRouteLeg(current, dest)
+        if not leg then
+            return nil, format("leg %d failed: %s", q, tostring(why))
+        end
+
+        route.totalCost = route.totalCost + (leg.totalCost or 0)
+        route.explored = route.explored + (leg.explored or 0)
+
+        for i, pt in ipairs(leg.points or {}) do
+            local skipStart = (q > 1 and i == 1)
+            local skipSyntheticStart = (q == 1 and i == 1 and current and current.isSyntheticStart)
+
+            if not skipStart and not skipSyntheticStart then
+                local copy = {}
+                for k, v in pairs(pt) do
+                    copy[k] = v
+                end
+
+                if i == #leg.points then
+                    copy.isQueueStop = true
+                    copy.queueIndex = q
+
+                    -- Preserve user-facing metadata from the original queue destination
+                    -- so Carbonite hover/sync labels can prefer the custom label instead of
+                    -- falling back to edge-type text like "Walk".
+                    copy.userLabel = dest.userLabel or copy.userLabel
+                    copy.userName = dest.userName or copy.userName
+                    copy.description = dest.description or copy.description
+                    copy.label = dest.userLabel or dest.userName or dest.label or copy.label
+                end
+
+                tinsert(route.points, copy)
+            end
+        end
+
+        current = dest
+    end
+
+    STATE.expandedRoute = route
+    return route
+end
+
+local function IsSyncAnchorPoint(routePoints, idx)
+    local pt = routePoints[idx]
+    if not pt or pt.edgeType == "start" then return false end
+
+    local nextPt = routePoints[idx + 1]
+
+    if idx == #routePoints then return true end
+    if pt.isQueueStop then return true end
+    if pt.forceStraight then return true end
+
+    if IsTransitEdgeType(pt.edgeType) then return true end
+    if nextPt and IsTransitEdgeType(nextPt.edgeType) then return true end
+
+    return false
+end
+
+local function ShouldKeepRoutePointForSync(routePoints, idx)
+    local pt = routePoints[idx]
+    if not pt or pt.edgeType == "start" or pt.isSyntheticStart then return false end
+
+    local prev = routePoints[idx - 1]
+    local nextPt = routePoints[idx + 1]
+
+    if not STATE.db or not STATE.db.simplifyTransitWaypoints then
+        return true
+    end
+
+    return IsSyncAnchorPoint(routePoints, idx)
+end
+
+local function CollapseConsecutiveSyncPoints(points)
+    local out = {}
+    for _, pt in ipairs(points or {}) do
+        local prev = out[#out]
+        local keep = true
+        if prev and prev.maI == pt.maI then
+            local d = Dist(prev.wx or 0, prev.wy or 0, pt.wx or 0, pt.wy or 0)
+            if d < 3 then
+                keep = false
+            elseif prev.edgeType == pt.edgeType and d < 2 then
+                keep = false
+            end
+        end
+        if keep then
+            out[#out + 1] = pt
+        end
+    end
+    return out
+end
+
+local function BuildSyncPoints(routePoints)
+    local out = {}
+    for i = 1, #(routePoints or {}) do
+        if ShouldKeepRoutePointForSync(routePoints, i) then
+            out[#out + 1] = routePoints[i]
+        end
+    end
+
+    out = CollapseConsecutiveSyncPoints(out)
+
+    if STATE.db then
+        local skip = tonumber(STATE.deepSyncSkipCount) or 0
+        while skip > 0 and #out > 0 do
+            tremove(out, 1)
+            skip = skip - 1
+        end
+    end
+
+    return out
+end
+
+local function SanitizeCarboniteLabel(s)
+    if not s then return "" end
+    s = tostring(s)
+    s = s:gsub("[%%%^%$%(%)%.%[%]%*%+%-%?]", " ")
+    s = s:gsub("%s+", " ")
+    s = s:gsub("^%s+", "")
+    s = s:gsub("%s+$", "")
+    return s
+end
+
+local function UseStraightLineForEdge(edgeType)
+    return edgeType and STRAIGHT_EDGE_TYPES[edgeType] or false
+end
+
+local function GetTargetTypeForRoutePoint(pt)
+    if not pt then
+        return TARGET_TYPE_GOTO
+    end
+
+    if pt.forceStraight then
+        return TARGET_TYPE_STRAIGHT
+    end
+
+    if STATE.db and not IsTransitSimplifiedEffective() then
+        return TARGET_TYPE_STRAIGHT
+    end
+
+    if UseStraightLineForEdge(pt.edgeType) then
+        return TARGET_TYPE_STRAIGHT
+    end
+
+    if STATE.db and STATE.db.hasFlyingMount then
+        if pt.edgeType == "walk" or pt.edgeType == "connector" or pt.edgeType == "walklink" or pt.edgeType == "transport-to-goal" or pt.edgeType == "walk-to-transport" or pt.edgeType == "goal-to-node" then
+            return TARGET_TYPE_STRAIGHT
+        end
+
+        if pt.isQueueStop then
+            return TARGET_TYPE_STRAIGHT
+        end
+    end
+
+    return TARGET_TYPE_GOTO
+end
+
+local function BuildSyncLabel(idx, pt)
+    local mapName = pt.mapName or ("Map " .. tostring(pt.maI))
+    local custom = pt.userLabel or pt.userName
+
+    if custom and custom ~= "" then
+        custom = SanitizeCarboniteLabel(custom)
+        return SanitizeCarboniteLabel(format("%d %s - %s", idx, mapName, tostring(custom)))
+    end
+
+    local edgeType = pt.edgeType or "node"
+    local detail
+
+    if edgeType == "walk-to-transport" then
+        detail = "Walk to transport"
+    elseif edgeType == "transport-to-goal" then
+        detail = "Walk to destination"
+    elseif edgeType == "walk" then
+        detail = "Walk"
+    elseif edgeType == "connector" or edgeType == "walklink" then
+        detail = "Passage"
+    elseif edgeType == "tram" then
+        detail = "Tram"
+    elseif edgeType == "zeppelin" then
+        detail = "Zeppelin"
+    elseif edgeType == "boat" then
+        detail = "Boat"
+    elseif edgeType == "portal" then
+        detail = "Portal"
+    elseif edgeType == "transport" then
+        detail = "Transport"
+    elseif edgeType == "taxi" then
+        detail = "Flight Master"
+    elseif edgeType == "fallback" then
+        detail = "Fallback"
+    else
+        detail = tostring(pt.label or edgeType)
+    end
+
+    return SanitizeCarboniteLabel(format("%d %s - %s", idx, mapName, detail))
+end
+
+local function BuildRouteSignature(points)
+    if type(points) ~= "table" or #points == 0 then
+        return ""
+    end
+
+    local parts = {}
+    for i = 1, #points do
+        local pt = points[i]
+        if pt then
+            local label = BuildSyncLabel(i, pt) or ""
+            local targetType = GetTargetTypeForRoutePoint(pt) or ""
+            parts[#parts + 1] = table.concat({
+                tostring(i),
+                tostring(pt.maI or ""),
+                string.format("%.3f", tonumber(pt.wx) or 0),
+                string.format("%.3f", tonumber(pt.wy) or 0),
+                tostring(pt.edgeType or ""),
+                tostring(label),
+                tostring(targetType),
+            }, "|")
+        end
+    end
+
+    return table.concat(parts, "||")
+end
+
 CW.TryTaxiPeriodicRefresh = function(now)
     EnsureDb()
     if not STATE.db or #(STATE.db.destinations or {}) == 0 then return end
@@ -875,13 +2391,36 @@ CW.TryTaxiPeriodicRefresh = function(now)
     end
 
     STATE.taxiNextRefreshAt = now + interval
-    InvalidateRoute("taxi periodic refresh")
 
-    if STATE.db.autoSyncToCarbonite then
-        SyncQueueToCarbonite()
+    local oldSignature = nil
+    do
+        local oldRoute = STATE.expandedRoute
+        if oldRoute and type(oldRoute.points) == "table" then
+            local oldSyncPoints = BuildSyncPoints(oldRoute.points or {})
+            oldSignature = BuildRouteSignature(oldSyncPoints)
+        end
     end
 
-    dbg("taxi: periodic route refresh")
+    STATE.expandedRoute = nil
+    STATE.deepSyncSkipCount = 0
+
+    local newRoute, why = BuildExpandedRoute()
+    if not newRoute then
+        pr("route rebuild failed: " .. tostring(why))
+        return
+    end
+
+    local newSyncPoints = BuildSyncPoints(newRoute.points or {})
+    local newSignature = BuildRouteSignature(newSyncPoints)
+
+    if oldSignature ~= newSignature then
+        if STATE.db.autoSyncToCarbonite then
+            SyncQueueToCarbonite()
+        end
+        dbg("taxi: periodic route refresh (path changed)")
+    else
+        dbg("taxi: periodic route refresh skipped sync (path unchanged)")
+    end
 end
 
 local EDGE_COLORS = {
@@ -1411,114 +2950,6 @@ local function ToggleRoutingTuningUi()
         STATE.tuningUi.frame:Show()
         ArmKeyboardModalFrame(STATE.tuningUi.frame)
     end
-end
-
-local function TransportLabel(edge)
-    edge = NormalizeTransportRecord(edge)
-    local kind = CanonicalTransportKind(GetEdgeTransportKind(edge))
-    local prefix = "Learned transport"
-    if kind == "portal" then
-        prefix = "Learned Portal"
-    elseif kind == "zeppelin" then
-        prefix = "Zeppelin"
-    elseif kind == "boat" then
-        prefix = "Boat"
-    elseif kind == "tram" then
-        prefix = "Tram"
-    elseif kind == "flight_master" then
-        prefix = "Flight Master"
-    end
-    return tostring(edge.label or (prefix .. ": " .. tostring(edge.fromMapName or edge.fromMaI or "?") .. " -> " .. tostring(edge.toMapName or edge.toMaI or "?")))
-end
-
-local function LearnedTransportKey(edge)
-    return BuildTransportRecordKey(edge)
-end
-
-local function HasLearnedTransportCoords(edge)
-    return edge
-        and edge.fromWx and edge.fromWy
-        and edge.toWx and edge.toWy
-end
-
--- Keep learned transport DB compact and stable across sessions:
--- for portal discovery we treat same from-map -> to-map as one learned route.
-local function CompactLearnedTransports()
-    EnsureDb()
-    local learned = STATE.db.learnedTransports
-    if type(learned) ~= "table" or #learned <= 1 then return end
-
-    local merged = {}
-    local byKey = {}
-    for _, edge in ipairs(learned) do
-        NormalizeTransportRecord(edge)
-        local key = LearnedTransportKey(edge)
-        if key and byKey[key] then
-            local dst = byKey[key]
-            -- If existing record is incomplete but a newer duplicate has full
-            -- coordinates, upgrade the stored edge so routing stays usable.
-            if not HasLearnedTransportCoords(dst) and HasLearnedTransportCoords(edge) then
-                dst.fromWx = edge.fromWx
-                dst.fromWy = edge.fromWy
-                dst.fromZx = edge.fromZx
-                dst.fromZy = edge.fromZy
-                dst.toWx = edge.toWx
-                dst.toWy = edge.toWy
-                dst.toZx = edge.toZx
-                dst.toZy = edge.toZy
-                dst.fromMapName = edge.fromMapName or dst.fromMapName
-                dst.toMapName = edge.toMapName or dst.toMapName
-                dst.label = edge.label or dst.label
-            end
-            
-            edge.uses = tonumber(edge.uses) or 1
-            if edge.lastSeen ~= nil then
-                local n = tonumber(edge.lastSeen)
-                if n ~= nil then
-                    edge.lastSeen = n
-                end
-            end
-
-            dst.uses = tonumber(dst.uses) or 1
-            if dst.lastSeen ~= nil then
-                local n = tonumber(dst.lastSeen)
-                if n ~= nil then
-                    dst.lastSeen = n
-                end
-            end
-
-            dst.uses = (tonumber(dst.uses) or 1) + (tonumber(edge.uses) or 1)
-
-            local edgeLastSeenNum = tonumber(edge.lastSeen)
-            local dstLastSeenNum = tonumber(dst.lastSeen)
-
-            if edgeLastSeenNum and (not dstLastSeenNum or edgeLastSeenNum > dstLastSeenNum) then
-                dst.lastSeen = edgeLastSeenNum
-            elseif edge.lastSeen and not dst.lastSeen then
-                dst.lastSeen = edge.lastSeen
-            end
-        else
-            local copy = {}
-            for k, v in pairs(edge) do copy[k] = v end
-            NormalizeTransportRecord(copy)
-            merged[#merged + 1] = copy
-            if key then
-                byKey[key] = copy
-            end
-        end
-    end
-
-    wipe(learned)
-    for i = 1, #merged do
-        learned[i] = merged[i]
-    end
-end
-
-local function EnsureTransportDb()
-    EnsureDb()
-    STATE.db.learnedTransports = STATE.db.learnedTransports or {}
-    CompactLearnedTransports()
-    return STATE.db.learnedTransports
 end
 
 local function EscapePortableField(value)
@@ -2462,22 +3893,6 @@ RouteToKnownLocation = function(index)
     if STATE.db.autoSyncToCarbonite then
         SyncQueueToCarbonite()
     end
-end
-
-local function Dist(wx1, wy1, wx2, wy2)
-    if wx1 == nil or wy1 == nil or wx2 == nil or wy2 == nil then
-        return nil
-    end
-    local dx = wx1 - wx2
-    local dy = wy1 - wy2
-    return sqrt(dx * dx + dy * dy)
-end
-
-local function WorldToYards(d)
-    if d == nil then
-        return huge
-    end
-    return d * 4.575
 end
 
 SaveQueueAsKnownRoute = function()
@@ -5177,16 +6592,6 @@ function TouchLearnedTransport(edge, fromPos, toPos)
     end
 end
 
-local function WalkCostSeconds(wx1, wy1, wx2, wy2)
-    local yardsPerSecond = (STATE.db and STATE.db.walkYardsPerSecond) or 7
-    if yardsPerSecond <= 0 then yardsPerSecond = 7 end
-    local d = Dist(wx1, wy1, wx2, wy2)
-    if not d then
-        return huge
-    end
-    return WorldToYards(d) / yardsPerSecond
-end
-
 local function IsModifierDown(name)
     name = name or "SHIFT"
     if name == "SHIFT" then return IsShiftKeyDown() end
@@ -5671,133 +7076,6 @@ local function RequestLearnedTransportConfirmation(fromPos, toPos, reason)
     pr("learned transport: " .. tostring(fromPos.mapName or fromPos.maI) .. " -> " .. tostring(toPos.mapName or toPos.maI))
 end
 
-local function TransportCostSeconds(transportType, wx1, wy1, wx2, wy2)
-    transportType = CanonicalTransportKind(transportType)
-    local travel = WalkCostSeconds(wx1, wy1, wx2, wy2)
-    local base
-    local tuning = GetRoutingTuning()
-
-    if transportType == "portal" then
-        -- Keep portal preference tuning-controlled; when portal bonus is zero,
-        -- avoid a hidden always-cheap portal base.
-        if (tuning.portalBonus or 0) <= 0 then
-            base = 60 + travel * 0.3
-        else
-            base = 25
-        end
-    elseif transportType == "tram" then
-        base = 45 + travel * 0.2
-    elseif transportType == "zeppelin" then
-        base = 75 + travel * 0.2
-    elseif transportType == "boat" then
-        base = 90 + travel * 0.2
-    elseif transportType == "flight_master" then
-        local yards = WorldToYards(Dist(wx1, wy1, wx2, wy2))
-        local speed = tonumber(tuning.flightMasterSpeedYardsPerSecond) or 15
-        if speed < 1 then speed = 1 end
-        base = (tonumber(tuning.flightMasterBoardingSeconds) or 20)
-            + (yards / speed)
-            + (tonumber(tuning.flightMasterLandingSeconds) or 12)
-    else
-        base = 60 + travel * 0.3
-    end
-
-    local adjusted = base - GetTransportPreferenceReductionSeconds(transportType, false)
-
-    if transportType == "portal" then
-        if adjusted < 7 then adjusted = 7 end
-    elseif transportType == "tram" then
-        if adjusted < 18 then adjusted = 18 end
-    elseif transportType == "zeppelin" or transportType == "boat" then
-        if adjusted < 35 then adjusted = 35 end
-    elseif transportType == "flight_master" then
-        if adjusted < 20 then adjusted = 20 end
-    else
-        if adjusted < 10 then adjusted = 10 end
-    end
-
-    return adjusted
-end
-
-local function InjectLearnedTransportEdges(addNode, addEdge, graph)
-    local learned = EnsureTransportDb()
-    if not learned or #learned == 0 then return end
-    for _, edge in ipairs(learned) do
-        if edge.fromMaI and edge.toMaI and edge.fromWx and edge.fromWy and edge.toWx and edge.toWy then
-            local n1 = addNode(edge.fromMaI, edge.fromWx, edge.fromWy, edge.fromMapName or tostring(edge.fromMaI), "transport")
-            local n2 = addNode(edge.toMaI, edge.toWx, edge.toWy, edge.toMapName or tostring(edge.toMaI), "transport")
-            if graph.nodes[n1] then
-                graph.nodes[n1].learnedPortalSource = true
-                graph.nodes[n1].learnedPortalLabel = TransportLabel(edge)
-            end
-            if graph.nodes[n2] then
-                graph.nodes[n2].learnedPortalDest = true
-                graph.nodes[n2].learnedPortalLabel = TransportLabel(edge)
-            end
-            NormalizeTransportRecord(edge)
-            local edgeType = CanonicalTransportKind(edge.transportKind or edge.type or "transport")
-            local hopCost = TransportCostSeconds(edgeType, edge.fromWx, edge.fromWy, edge.toWx, edge.toWy)
-            addEdge(n1, n2, hopCost, edgeType, TransportLabel(edge), IsBidirectionalTransportRecord(edge), { learnedHop = (edgeType == "portal") })
-            graph.links[#graph.links + 1] = { a = n1, b = n2, type = edgeType, learned = true, bidirectional = IsBidirectionalTransportRecord(edge) }
-        end
-    end
-end
-
--- Known-route hops are intentional user-authored shortcuts. Keep them in the
--- deep graph with a strongly preferred synthetic hop cost so the pathfinder
--- will choose a saved route when it actually lines up with the requested trip.
-local function GetKnownRouteHopCostSeconds(loc, a, b)
-    local transportKind = CanonicalTransportKind(InferStoredTransportKind(loc) or "route")
-    if transportKind == "route" then
-        return math.max(6, WalkCostSeconds(a.wx, a.wy, b.wx, b.wy))
-    end
-    return TransportCostSeconds(transportKind, a.wx, a.wy, b.wx, b.wy)
-end
-
-local function InjectKnownRouteEdges(addNode, addEdge, graph)
-    local known = STATE.db and STATE.db.knownLocations or nil
-    if type(known) ~= "table" or #known == 0 then return end
-
-    for _, loc in ipairs(known) do
-        if loc and loc.kind == "route" and type(loc.routePoints) == "table" and #loc.routePoints >= 2 then
-            local routeName = tostring(loc.name or loc.label or "Known route")
-            local lastSegmentIndex = #loc.routePoints - 1
-
-            for i = 1, lastSegmentIndex do
-                local a = loc.routePoints[i]
-                local b = loc.routePoints[i + 1]
-
-                if a and b and a.maI and b.maI and a.wx and a.wy and b.wx and b.wy then
-                    local n1 = addNode(a.maI, a.wx, a.wy, a.mapName or tostring(a.maI), "route")
-                    local n2 = addNode(b.maI, b.wx, b.wy, b.mapName or tostring(b.maI), "route")
-
-                    if graph.nodes[n1] then
-                        graph.nodes[n1].knownRoute = true
-                        graph.nodes[n1].knownRouteName = routeName
-                        if i == 1 then
-                            graph.nodes[n1].knownRouteTerminal = true
-                        end
-                    end
-                    if graph.nodes[n2] then
-                        graph.nodes[n2].knownRoute = true
-                        graph.nodes[n2].knownRouteName = routeName
-                        if i == lastSegmentIndex then
-                            graph.nodes[n2].knownRouteTerminal = true
-                        end
-                    end
-
-                    local routeKind = CanonicalTransportKind(InferStoredTransportKind(loc) or "route")
-                    local isBidirectional = (loc.bidirectional == true) or routeKind == "flight_master"
-                    addEdge(n1, n2, GetKnownRouteHopCostSeconds(loc, a, b), routeKind, "Known route: " .. routeName, isBidirectional, {
-                        routeTransportKind = routeKind,
-                    })
-                    graph.links[#graph.links + 1] = { a = n1, b = n2, type = routeKind, knownRoute = true, bidirectional = isBidirectional }
-                end
-            end
-        end
-    end
-end
-
 local function ListLearnedTransports()
     local learned = EnsureTransportDb()
     if #learned == 0 then
@@ -5913,92 +7191,6 @@ local function PulseTransportDiscovery(elapsed)
         end
     end
 end
-
-local function SanitizeCarboniteLabel(s)
-    if not s then return "" end
-    s = tostring(s)
-    s = s:gsub("[%%%^%$%(%)%.%[%]%*%+%-%?]", " ")
-    s = s:gsub("%s+", " ")
-    s = s:gsub("^%s+", "")
-    s = s:gsub("%s+$", "")
-    return s
-end
-
-local function UseStraightLineForEdge(edgeType)
-    return edgeType and STRAIGHT_EDGE_TYPES[edgeType] or false
-end
-
-local function GetTargetTypeForRoutePoint(pt)
-    if not pt then
-        return TARGET_TYPE_GOTO
-    end
-
-    if pt.forceStraight then
-        return TARGET_TYPE_STRAIGHT
-    end
-
-    if STATE.db and not IsTransitSimplifiedEffective() then
-        return TARGET_TYPE_STRAIGHT
-    end
-
-    if UseStraightLineForEdge(pt.edgeType) then
-        return TARGET_TYPE_STRAIGHT
-    end
-
-    if STATE.db and STATE.db.hasFlyingMount then
-        if pt.edgeType == "walk" or pt.edgeType == "connector" or pt.edgeType == "walklink" or pt.edgeType == "transport-to-goal" or pt.edgeType == "walk-to-transport" or pt.edgeType == "goal-to-node" then
-            return TARGET_TYPE_STRAIGHT
-        end
-
-        if pt.isQueueStop then
-            return TARGET_TYPE_STRAIGHT
-        end
-    end
-
-    return TARGET_TYPE_GOTO
-end
-
-local function BuildSyncLabel(idx, pt)
-    local mapName = pt.mapName or ("Map " .. tostring(pt.maI))
-    local custom = pt.userLabel or pt.userName
-
-    if custom and custom ~= "" then
-        custom = SanitizeCarboniteLabel(custom)
-        return SanitizeCarboniteLabel(format("%d %s - %s", idx, mapName, tostring(custom)))
-    end
-
-    local edgeType = pt.edgeType or "node"
-    local detail
-
-    if edgeType == "walk-to-transport" then
-        detail = "Walk to transport"
-    elseif edgeType == "transport-to-goal" then
-        detail = "Walk to destination"
-    elseif edgeType == "walk" then
-        detail = "Walk"
-    elseif edgeType == "connector" or edgeType == "walklink" then
-        detail = "Passage"
-    elseif edgeType == "tram" then
-        detail = "Tram"
-    elseif edgeType == "zeppelin" then
-        detail = "Zeppelin"
-    elseif edgeType == "boat" then
-        detail = "Boat"
-    elseif edgeType == "portal" then
-        detail = "Portal"
-    elseif edgeType == "transport" then
-        detail = "Transport"
-    elseif edgeType == "taxi" then
-        detail = "Flight Master"
-    elseif edgeType == "fallback" then
-        detail = "Fallback"
-    else
-        detail = tostring(pt.label or edgeType)
-    end
-
-    return SanitizeCarboniteLabel(format("%d %s - %s", idx, mapName, detail))
-end
-
 
 local function InstallCarboniteSclGuard()
     if not Nx or not Nx.Map or type(Nx.Map.SCL) ~= "function" then return end
@@ -6158,51 +7350,6 @@ InvalidateRoute = function(reason)
     end
 end
 
-local function InferTransportType(name1, name2)
-    local s = lower((name1 or "") .. " " .. (name2 or ""))
-    if match(s, "flight master") or match(s, "taxi") or match(s, "gryphon") or match(s, "wind rider") then return "flight_master" end
-    if match(s, "zeppelin") then return "zeppelin" end
-    if match(s, "boat") then return "boat" end
-    if match(s, "tram") then return "tram" end
-    if match(s, "portal") then return "portal" end
-    return "transport"
-end
-
-local function IsRealTransportType(edgeType)
-    return edgeType and STRAIGHT_EDGE_TYPES[edgeType] or false
-end
-
-local function IsTransitEdgeType(edgeType)
-    return edgeType and TRANSIT_EDGE_TYPES[edgeType] or false
-end
-
-local function InferConnectorEdgeType(coT, name1, name2)
-    if coT == 1 then
-        return "connector"
-    end
-    return InferTransportType(name1, name2)
-end
-
-local function ConnectorCostSeconds(edgeType, wx1, wy1, wx2, wy2)
-    if edgeType == "connector" then
-        return WalkCostSeconds(wx1, wy1, wx2, wy2)
-    end
-    return TransportCostSeconds(edgeType, wx1, wy1, wx2, wy2)
-end
-
-local function NormalizeTaxiKey(name)
-    if not name then return nil end
-    name = tostring(name)
-    name = gsub(name, "^%s+", "")
-    name = gsub(name, "%s+$", "")
-    name = gsub(name, "[%(%)]", " ")
-    name = gsub(name, "[,:%-%./']", " ")
-    name = gsub(name, "%s+", " ")
-    name = gsub(name, "^%s+", "")
-    name = gsub(name, "%s+$", "")
-    return lower(name)
-end
-
 function CW.BuildTaxiKeyVariants(name)
     local out = {}
     local function addVariant(v)
@@ -6260,861 +7407,6 @@ function CW.RefreshSessionKnownTaxisFromTaxiMap()
 
     return changedAny
 end
-
-local function BuildKnownTaxiLookup()
-    local out = {}
-
-    if NxCData and type(NxCData["Taxi"]) == "table" then
-        for taxiName, known in pairs(NxCData["Taxi"]) do
-            if known then
-                for key in pairs(CW.BuildTaxiKeyVariants(taxiName)) do
-                    out[key] = taxiName
-                end
-            end
-        end
-    end
-
-    if type(STATE.sessionKnownTaxis) == "table" then
-        for key, taxiName in pairs(STATE.sessionKnownTaxis) do
-            if key and taxiName and out[key] == nil then
-                out[key] = taxiName
-            end
-        end
-    end
-
-    return out
-end
-
-local function BuildKnownTaxiNodes(map)
-    if not (STATE.db and STATE.db.useFlightMasters) then return {} end
-    if STATE.db and IsTransitSimplifiedEffective() then return {} end
-    if not Nx or not Nx.Tra then
-        return {}
-    end
-
-    local knownLookup = BuildKnownTaxiLookup()
-    if not next(knownLookup) then
-        return {}
-    end
-
-    local out = {}
-    local seen = {}
-    local rawCandidates = {}
-
-    local function FindKnownTaxiName(nameA, nameB)
-        for key in pairs(CW.BuildTaxiKeyVariants(nameA)) do
-            if knownLookup[key] then
-                return knownLookup[key], key
-            end
-        end
-        for key in pairs(CW.BuildTaxiKeyVariants(nameB)) do
-            if knownLookup[key] then
-                return knownLookup[key], key
-            end
-        end
-        return nil, nil
-    end
-
-    local function pushTaxiAny(taxiName, npcName, maI, wx, wy, knownTaxiName)
-        local canonicalName = knownTaxiName or taxiName
-        local canonicalKey = NormalizeTaxiKey(canonicalName)
-        if not canonicalKey or seen[canonicalKey] then return end
-        if not (maI and wx and wy) then return end
-
-        local ok, zx, zy = pcall(map.GZP, map, maI, wx, wy)
-        if not (ok and zx and zy and zx >= 0 and zx <= 100 and zy >= 0 and zy <= 100) then return end
-
-        seen[canonicalKey] = true
-        out[#out + 1] = {
-            taxiName = canonicalName,
-            npcName = npcName or canonicalName,
-            maI = maI,
-            wx = wx,
-            wy = wy,
-            zx = zx,
-            zy = zy,
-        }
-    end
-
-    if type(Nx.Tra.Tra) == "table" then
-        for _, list in pairs(Nx.Tra.Tra) do
-            if type(list) == "table" then
-                for _, nod in ipairs(list) do
-                    if type(nod) == "table" and nod.LoN and nod.MaI and nod.WX and nod.WY then
-                        rawCandidates[#rawCandidates + 1] = {
-                            taxiName = nod.LoN,
-                            npcName = nod.Nam or nod.LoN,
-                            maI = nod.MaI,
-                            wx = nod.WX,
-                            wy = nod.WY,
-                        }
-                    end
-                end
-            end
-        end
-    end
-
-    for _, cand in ipairs(rawCandidates) do
-        local knownTaxiName = FindKnownTaxiName(cand.taxiName, cand.npcName)
-        if knownTaxiName then
-            pushTaxiAny(cand.taxiName, cand.npcName, cand.maI, cand.wx, cand.wy, knownTaxiName)
-        end
-    end
-
-    if Nx.Map and Nx.Map.Gui and type(Nx.Map.Gui.FiT2) == "function" then
-        for _, knownTaxiName in pairs(knownLookup) do
-            local canonicalKey = NormalizeTaxiKey(knownTaxiName)
-            if canonicalKey and not seen[canonicalKey] then
-                local npcName, wx, wy = Nx.Map.Gui:FiT2(knownTaxiName)
-                if wx and wy then
-                    local bestMapId, bestDist2 = nil, nil
-
-                    for _, cand in ipairs(rawCandidates) do
-                        local matchedName = FindKnownTaxiName(cand.taxiName, cand.npcName)
-                        if matchedName == knownTaxiName and cand.maI then
-                            local ok, zx, zy = pcall(map.GZP, map, cand.maI, wx, wy)
-                            if ok and zx and zy and zx >= 0 and zx <= 100 and zy >= 0 and zy <= 100 then
-                                local dx = zx - 50
-                                local dy = zy - 50
-                                local dist2 = dx * dx + dy * dy
-                                if not bestDist2 or dist2 < bestDist2 then
-                                    bestMapId, bestDist2 = cand.maI, dist2
-                                end
-                            end
-                        end
-                    end
-
-                    if not bestMapId then
-                        for maI = 1, 5000 do
-                            local ok, zx, zy = pcall(map.GZP, map, maI, wx, wy)
-                            if ok and zx and zy and zx >= 0 and zx <= 100 and zy >= 0 and zy <= 100 then
-                                local dx = zx - 50
-                                local dy = zy - 50
-                                local dist2 = dx * dx + dy * dy
-                                if not bestDist2 or dist2 < bestDist2 then
-                                    bestMapId, bestDist2 = maI, dist2
-                                end
-                            end
-                        end
-                    end
-
-                    if bestMapId then
-                        pushTaxiAny(knownTaxiName, npcName or knownTaxiName, bestMapId, wx, wy, knownTaxiName)
-                    end
-                end
-            end
-        end
-    end
-
-    return out
-end
-
-local function EnsureGraph()
-    if STATE.graph then return STATE.graph end
-
-    local map = GetMap()
-    if not map or not Nx or not Nx.ZoC then
-        return nil, "carbonite-data-not-ready"
-    end
-
-    local graph = {
-        nodes = {},
-        links = {},
-        nodeCount = 0,
-        edgeCount = 0,
-    }
-
-    local nodeIndex = {}
-
-    local function makeNodeKey(maI, wx, wy, nodeType, label)
-        return table.concat({ tostring(maI or "?"), format("%.3f", wx or 0), format("%.3f", wy or 0), tostring(nodeType or "?"), tostring(label or "") }, "|")
-    end
-
-    local function addNode(maI, wx, wy, label, nodeType)
-        local key = makeNodeKey(maI, wx, wy, nodeType, label)
-        if nodeIndex[key] then
-            return nodeIndex[key]
-        end
-
-        graph.nodeCount = graph.nodeCount + 1
-        local id = graph.nodeCount
-        graph.nodes[id] = {
-            id = id,
-            maI = maI,
-            wx = wx,
-            wy = wy,
-            label = label,
-            type = nodeType,
-            continent = nil,
-            edges = {},
-        }
-        nodeIndex[key] = id
-        return id
-    end
-
-    local function addEdge(a, b, cost, edgeType, label, bidirectional, opts)
-        opts = opts or {}
-        if not graph.nodes[a] or not graph.nodes[b] then return end
-        tinsert(graph.nodes[a].edges, {
-            to = b,
-            cost = cost,
-            type = edgeType,
-            label = label,
-            learnedHop = opts.learnedHop,
-            routeTransportKind = opts.routeTransportKind,
-        })
-        graph.edgeCount = graph.edgeCount + 1
-        if bidirectional then
-            tinsert(graph.nodes[b].edges, {
-                to = a,
-                cost = cost,
-                type = edgeType,
-                label = label,
-                learnedHop = opts.learnedHop,
-                routeTransportKind = opts.routeTransportKind,
-            })
-            graph.edgeCount = graph.edgeCount + 1
-        end
-    end
-
-    local function addPassageEdgesFromMWI()
-        if not map.MWI then return end
-        for maI, win1 in pairs(map.MWI) do
-            if type(win1) == "table" and type(win1.Con1) == "table" then
-                for destMaI, zco1 in pairs(win1.Con1) do
-                    if type(zco1) == "table" then
-                        for _, con in ipairs(zco1) do
-                            if type(con) == "table" and con.StX and con.StY and con.EnX and con.EnY then
-                                local fromName = map.ITN and map:ITN(con.SMI or maI) or tostring(con.SMI or maI)
-                                local toName = map.ITN and map:ITN(con.EMI1 or destMaI) or tostring(con.EMI1 or destMaI)
-                                local n1 = addNode(con.SMI or maI, con.StX, con.StY, fromName, "connector")
-                                local n2 = addNode(con.EMI1 or destMaI, con.EnX, con.EnY, toName, "connector")
-                                addEdge(n1, n2, con.Dis or WalkCostSeconds(con.StX, con.StY, con.EnX, con.EnY), "connector", format("Passage: %s -> %s", tostring(fromName), tostring(toName)), true)
-                                graph.links[#graph.links + 1] = { a = n1, b = n2, type = "connector" }
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    addPassageEdgesFromMWI()
-
-    for _, str in ipairs(Nx.ZoC) do
-        local fla, coT, mI1, x1, y1, mI2, x2, y2, na11, na21 = map:CoU(str)
-        if mI1 and mI2 and x1 and y1 and x2 and y2 and x1 ~= 0 and y1 ~= 0 and x2 ~= 0 and y2 ~= 0 then
-            local wx1, wy1 = map:GWP(mI1, x1, y1)
-            local wx2, wy2 = map:GWP(mI2, x2, y2)
-            local edgeType = InferConnectorEdgeType(coT, na11, na21)
-            local fromName = (na11 and na11 ~= "") and na11 or (map.ITN and map:ITN(mI1) or tostring(mI1))
-            local toName = (na21 and na21 ~= "") and na21 or (map.ITN and map:ITN(mI2) or tostring(mI2))
-            local n1 = addNode(mI1, wx1, wy1, fromName, edgeType == "connector" and "connector" or "transport")
-            local n2 = addNode(mI2, wx2, wy2, toName, edgeType == "connector" and "connector" or "transport")
-            local bidi = band(fla or 0, 1) == 1
-            local edgeLabel
-            if edgeType == "connector" then
-                edgeLabel = format("Walk connection: %s -> %s", tostring(map.ITN and map:ITN(mI1) or mI1), tostring(map.ITN and map:ITN(mI2) or mI2))
-            else
-                edgeLabel = (edgeType:gsub("^%l", string.upper)) .. ": " .. tostring(map.ITN and map:ITN(mI1) or mI1) .. " -> " .. tostring(map.ITN and map:ITN(mI2) or mI2)
-            end
-            addEdge(n1, n2, ConnectorCostSeconds(edgeType, wx1, wy1, wx2, wy2), edgeType, edgeLabel, bidi)
-            graph.links[#graph.links + 1] = {a = n1, b = n2, type = edgeType}
-        end
-    end
-
-    InjectLearnedTransportEdges(addNode, addEdge, graph)
-    InjectKnownRouteEdges(addNode, addEdge, graph)
-
-    local taxiNodes = BuildKnownTaxiNodes(map)
-    local taxiNodeIds = {}
-    if #taxiNodes > 0 and Nx and Nx.Tra and type(Nx.Tra.TFCT) == "function" then
-        for _, taxi in ipairs(taxiNodes) do
-            local nodeId = addNode(taxi.maI, taxi.wx, taxi.wy, taxi.taxiName, "transport")
-            taxiNodeIds[#taxiNodeIds + 1] = { id = nodeId, taxiName = taxi.taxiName, npcName = taxi.npcName, maI = taxi.maI, wx = taxi.wx, wy = taxi.wy }
-        end
-
-        for i = 1, #taxiNodeIds do
-            local a = taxiNodeIds[i]
-            for j = i + 1, #taxiNodeIds do
-                local b = taxiNodeIds[j]
-                local ok, directCost = pcall(Nx.Tra.TFCT, Nx.Tra, a.taxiName, b.taxiName)
-                if ok and directCost and directCost > 0 then
-                    addEdge(a.id, b.id, TransportCostSeconds("flight_master", a.wx, a.wy, b.wx, b.wy), "flight_master", format("Flight Master: %s -> %s", tostring(a.taxiName), tostring(b.taxiName)), true)
-                    graph.links[#graph.links + 1] = {a = a.id, b = b.id, type = "flight_master"}
-                end
-            end
-        end
-
-        for _, tinfo in ipairs(taxiNodeIds) do
-            local gn = graph.nodes[tinfo.id]
-            if gn then
-                gn.taxiHub = true
-            end
-        end
-    end
-
-    local walkRadius = 320
-    local walkNeighbors = 4
-    local forcedWalkPenalty = 900
-    local function IsTravelNodeType(t)
-        return t == "connector" or t == "transport" or t == "route"
-    end
-    for i = 1, graph.nodeCount do
-        local ni = graph.nodes[i]
-        local sameMap = {}
-        for j = 1, graph.nodeCount do
-            if i ~= j then
-                local nj = graph.nodes[j]
-                if ni.maI == nj.maI then
-                    local baseCost = WalkCostSeconds(ni.wx, ni.wy, nj.wx, nj.wy)
-                    if baseCost <= walkRadius then
-                        sameMap[#sameMap + 1] = { id = j, cost = math.max(1, baseCost), forced = false }
-                    elseif IsTravelNodeType(ni.type) and IsTravelNodeType(nj.type) then
-                        sameMap[#sameMap + 1] = { id = j, cost = baseCost + forcedWalkPenalty, forced = true }
-                    end
-                end
-            end
-        end
-        table.sort(sameMap, function(a, b)
-            return a.cost < b.cost
-        end)
-        local added = 0
-        local forcedAdded = 0
-        for _, cand in ipairs(sameMap) do
-            if not cand.forced then
-                if added < walkNeighbors then
-                    addEdge(i, cand.id, cand.cost, "walk", "walk", false)
-                    added = added + 1
-                end
-            elseif added == 0 and forcedAdded < 1 then
-                addEdge(i, cand.id, cand.cost, "walk", "walk-penalized", false)
-                forcedAdded = forcedAdded + 1
-            end
-        end
-    end
-
-    local function linkLearnedPortalSourcesToNearbyCarbonitePortals()
-        local function hasWalkEdge(fromId, toId)
-            for _, e in ipairs(graph.nodes[fromId].edges or {}) do
-                if e.to == toId and e.type == "walk" then
-                    return true
-                end
-            end
-            return false
-        end
-        local maxWalkSec = 680
-        for i = 1, graph.nodeCount do
-            local n = graph.nodes[i]
-            if n and n.learnedPortalSource then
-                for j = 1, graph.nodeCount do
-                    if i ~= j then
-                        local m = graph.nodes[j]
-                        if m and m.maI == n.maI and m.type == "transport" and not m.learnedPortalSource then
-                            local hasPortal = false
-                            for _, e in ipairs(m.edges or {}) do
-                                if e.type == "portal" then
-                                    hasPortal = true
-                                    break
-                                end
-                            end
-                            if hasPortal then
-                                local sec = WalkCostSeconds(n.wx, n.wy, m.wx, m.wy)
-                                if sec <= maxWalkSec then
-                                    local c = math.max(1, sec)
-                                    if not hasWalkEdge(i, j) then
-                                        addEdge(i, j, c, "walk", "walk", false)
-                                    end
-                                    if not hasWalkEdge(j, i) then
-                                        addEdge(j, i, c, "walk", "walk", false)
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    linkLearnedPortalSourcesToNearbyCarbonitePortals()
-
-    STATE.graph = graph
-    return graph
-end
-
--- Same as origin/master: h=0 => uniform-cost search (optimal for non-negative edge weights).
-local function HeuristicCost()
-    return 0
-end
-
-local function FindPathAStar(nodes, startId, goalId)
-    local open = {[startId] = true}
-    local openList = {startId}
-    local came = {}
-    local cameEdge = {}
-    local gScore = {[startId] = 0}
-    local fScore = {[startId] = HeuristicCost(nodes[startId], nodes[goalId])}
-    local explored = 0
-
-    while #openList > 0 do
-        local bestIndex, current, bestF = 1, openList[1], fScore[openList[1]] or huge
-        for i = 2, #openList do
-            local nid = openList[i]
-            local f = fScore[nid] or huge
-            if f < bestF then
-                bestIndex, current, bestF = i, nid, f
-            end
-        end
-
-        tremove(openList, bestIndex)
-        open[current] = nil
-        explored = explored + 1
-
-        if current == goalId then
-            local path = {current}
-            while came[current] do
-                current = came[current]
-                tinsert(path, 1, current)
-            end
-            return path, cameEdge, gScore[goalId] or 0, explored
-        end
-
-        local node = nodes[current]
-        if node and node.edges then
-            for _, edge in ipairs(node.edges) do
-                local tentative = (gScore[current] or huge) + (edge.cost or huge)
-                if tentative < (gScore[edge.to] or huge) then
-                    came[edge.to] = current
-                    cameEdge[edge.to] = edge
-                    gScore[edge.to] = tentative
-                    fScore[edge.to] = tentative + HeuristicCost(nodes[edge.to], nodes[goalId])
-                    if not open[edge.to] then
-                        open[edge.to] = true
-                        tinsert(openList, edge.to)
-                    end
-                end
-            end
-        end
-    end
-
-    return nil, nil, nil, explored
-end
-
--- Compare plain start->goal A* with "walk to learned source on start map + learned portal + tail":
--- guarantees /cw transports is chosen when total time is lower (Dijkstra alone can still prefer tram first hop).
-local function FindBestPathWithOptionalLearnedPrefix(nodes, startId, goalId, startPoint, baseCount)
-    local path0, ce0, cost0, ex0 = FindPathAStar(nodes, startId, goalId)
-    if not path0 then
-        return nil, nil, nil, ex0 or 0
-    end
-    local tuning = GetRoutingTuning()
-    if (tuning.portalBonus or 0) <= 0 and (tuning.learnedPortalBonus or 0) <= 0 then
-        return path0, ce0, cost0, ex0
-    end
-    local bestPath, bestCame, bestCost, bestEx = path0, ce0, cost0, ex0
-    local sx, sy = nodes[startId].wx, nodes[startId].wy
-
-    for nid = 1, baseCount do
-        local nn = nodes[nid]
-        if nn and nn.learnedPortalSource and nn.maI == startPoint.maI then
-            local w0 = WalkCostSeconds(sx, sy, nn.wx, nn.wy)
-            for _, ed in ipairs(nn.edges or {}) do
-                if ed.learnedHop then
-                    local p2, ce2, c2, ex2 = FindPathAStar(nodes, ed.to, goalId)
-                    if p2 and c2 then
-                        local total = w0 + (ed.cost or huge) + c2
-                        if total < bestCost then
-                            bestCost = total
-                            bestEx = (ex0 or 0) + (ex2 or 0)
-                            local merged = { startId, nid }
-                            for k = 1, #p2 do
-                                merged[#merged + 1] = p2[k]
-                            end
-                            local mce = {}
-                            mce[nid] = {
-                                to = nid,
-                                cost = w0,
-                                type = "walk",
-                                label = "walk-to-node",
-                            }
-                            mce[ed.to] = ed
-                            for k = 2, #p2 do
-                                local vx = p2[k]
-                                if ce2[vx] then
-                                    mce[vx] = ce2[vx]
-                                end
-                            end
-                            bestPath = merged
-                            bestCame = mce
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return bestPath, bestCame, bestCost, bestEx
-end
-
-local function CollapseDeepTaxiChains(points)
-    if type(points) ~= "table" or #points <= 2 then
-        return points
-    end
-
-    local out = {}
-    local i = 1
-
-    local function ClonePoint(pt)
-        local copy = {}
-        for k, v in pairs(pt or {}) do
-            copy[k] = v
-        end
-        return copy
-    end
-
-    local function IsFlightMasterRoutePoint(pt)
-        if not pt then return false end
-        local kind = CanonicalTransportKind(pt.transportKind or pt.edgeType)
-        return kind == "flight_master"
-    end
-
-    local function IsMinorFlightMasterConnector(pt)
-        if not pt then return false end
-        if pt.edgeType ~= "walk-to-transport" then return false end
-        local cost = tonumber(pt.cost) or huge
-        return cost <= 3
-    end
-
-    while i <= #points do
-        local pt = points[i]
-
-        if IsFlightMasterRoutePoint(pt) then
-            local chainStart = i
-            local chainEnd = i
-            local totalTaxiCost = tonumber(pt.cost) or 0
-            local lastFlightIndex = i
-
-            while chainEnd < #points do
-                local nextPt = points[chainEnd + 1]
-                if IsFlightMasterRoutePoint(nextPt) then
-                    chainEnd = chainEnd + 1
-                    lastFlightIndex = chainEnd
-                    totalTaxiCost = totalTaxiCost + (tonumber(nextPt.cost) or 0)
-                elseif IsMinorFlightMasterConnector(nextPt) and chainEnd + 2 <= #points and IsFlightMasterRoutePoint(points[chainEnd + 2]) then
-                    chainEnd = chainEnd + 1
-                    totalTaxiCost = totalTaxiCost + (tonumber(nextPt.cost) or 0)
-                else
-                    break
-                end
-            end
-
-            if lastFlightIndex > chainStart then
-                local firstTaxiPoint = points[chainStart]
-                local lastTaxiPoint = points[lastFlightIndex]
-                local collapsed = ClonePoint(lastTaxiPoint)
-
-                collapsed.edgeType = "flight_master"
-                collapsed.transportKind = "flight_master"
-                collapsed.cost = totalTaxiCost
-                collapsed.transportChainStart = chainStart
-                collapsed.transportChainEnd = lastFlightIndex
-                collapsed.collapsedMinorConnector = true
-
-                local fromName = firstTaxiPoint.label or firstTaxiPoint.mapName or tostring(firstTaxiPoint.maI or "?")
-                local toName = lastTaxiPoint.label or lastTaxiPoint.mapName or tostring(lastTaxiPoint.maI or "?")
-                collapsed.label = "Flight Master: " .. tostring(fromName) .. " -> " .. tostring(toName)
-
-                out[#out + 1] = collapsed
-                i = chainEnd + 1
-            else
-                local single = ClonePoint(pt)
-                single.edgeType = "flight_master"
-                single.transportKind = "flight_master"
-                out[#out + 1] = single
-                i = i + 1
-            end
-        else
-            out[#out + 1] = ClonePoint(pt)
-            i = i + 1
-        end
-    end
-
-    return out
-end
-
-local function BuildTransportLeg(startPoint, destPoint)
-    local baseGraph, why = EnsureGraph()
-    if not baseGraph then
-        return nil, "graph-unavailable:" .. tostring(why)
-    end
-
-    local nodes = {}
-    local baseCount = baseGraph.nodeCount or 0
-    for id = 1, baseCount do
-        local n = baseGraph.nodes[id]
-        if n then
-            local copyEdges = {}
-            for _, e in ipairs(n.edges) do
-                copyEdges[#copyEdges + 1] = {
-                    to = e.to,
-                    cost = e.cost,
-                    type = e.type,
-                    label = e.label,
-                    learnedHop = e.learnedHop,
-                    routeTransportKind = e.routeTransportKind,
-                }
-            end
-            nodes[id] = {
-                id = n.id,
-                maI = n.maI,
-                wx = n.wx,
-                wy = n.wy,
-                label = n.label,
-                type = n.type,
-                continent = n.continent,
-                edges = copyEdges,
-                learnedPortalSource = n.learnedPortalSource and true or false,
-                learnedPortalDest = n.learnedPortalDest and true or false,
-                learnedPortalLabel = n.learnedPortalLabel,
-                                taxiHub = n.taxiHub and true or false,
-                knownRoute = n.knownRoute and true or false,
-                                knownRouteName = n.knownRouteName,
-                knownRouteTerminal = n.knownRouteTerminal and true or false,
-            }
-        end
-    end
-
-    local nextId = baseCount
-
-    local function addQueryNode(pt, nodeType, label)
-        nextId = nextId + 1
-        nodes[nextId] = {
-            id = nextId,
-            maI = pt.maI,
-            wx = pt.wx,
-            wy = pt.wy,
-            label = label,
-            type = nodeType,
-            edges = {},
-        }
-        return nextId
-    end
-
-    local function connectBidirectional(a, b, cost, edgeType, label)
-        tinsert(nodes[a].edges, {to = b, cost = cost, type = edgeType, label = label})
-        tinsert(nodes[b].edges, {to = a, cost = cost, type = edgeType, label = label})
-    end
-
-       local function attachQueryNode(queryId, preferMapId, preferContinent, outwardLabel)
-        local isStart = outwardLabel == "walk-to-node"
-        local isGoal = outwardLabel == "node-to-goal"
-        local tuning = GetRoutingTuning()
-
-        local function countPortalTaxi(node)
-            local pe, te = 0, 0
-            if node and node.edges then
-                for _, e in ipairs(node.edges) do
-                    if e.type == "portal" then
-                        pe = pe + 1
-                    elseif e.type == "taxi" then
-                        te = te + 1
-                    end
-                end
-            end
-            return pe, te
-        end
-
-        local sameMap = {}
-        for id, n in pairs(nodes) do
-            if type(id) == "number"
-                and id ~= queryId
-                and n.maI == preferMapId
-                and n.type ~= "start"
-                and n.type ~= "goal" then
-
-                local raw = WalkCostSeconds(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy)
-                local yards = WorldToYards(Dist(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy))
-                local pe, te = countPortalTaxi(n)
-
-                local candidate = {
-                    id = id,
-                    rawCost = raw,
-                    yards = yards,
-                    learnedS = n.learnedPortalSource and true or false,
-                    learnedD = n.learnedPortalDest and true or false,
-                    taxiHub = n.taxiHub and true or false,
-                    knownRoute = n.knownRoute and true or false,
-                    knownRouteName = n.knownRouteName,
-                    knownRouteTerminal = n.knownRouteTerminal and true or false,
-                    portalEdges = pe,
-                    taxiEdges = te,
-                }
-                candidate.score = GetAttachCandidateScoreSeconds(raw, candidate, isStart, isGoal)
-                sameMap[#sameMap + 1] = candidate
-            end
-        end
-
-        -- If there are no nodes on the exact map (common for destination maps),
-        -- fall back to same-continent candidates so portal/taxi legs can still connect.
-        if #sameMap == 0 and preferContinent then
-            for id, n in pairs(nodes) do
-                if type(id) == "number"
-                    and id ~= queryId
-                    and n.continent == preferContinent
-                    and n.type ~= "start"
-                    and n.type ~= "goal" then
-
-                    local raw = WalkCostSeconds(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy)
-                    local yards = WorldToYards(Dist(nodes[queryId].wx, nodes[queryId].wy, n.wx, n.wy))
-                    local pe, te = countPortalTaxi(n)
-                    local candidate = {
-                    id = id,
-                    rawCost = raw,
-                    yards = yards,
-                    learnedS = n.learnedPortalSource and true or false,
-                    learnedD = n.learnedPortalDest and true or false,
-                    taxiHub = n.taxiHub and true or false,
-                    knownRoute = n.knownRoute and true or false,
-                    knownRouteName = n.knownRouteName,
-                    knownRouteTerminal = n.knownRouteTerminal and true or false,
-                    portalEdges = pe,
-                    taxiEdges = te,
-                }
-                candidate.score = GetAttachCandidateScoreSeconds(raw, candidate, isStart, isGoal)
-                sameMap[#sameMap + 1] = candidate
-                end
-            end
-        end
-
-        table.sort(sameMap, function(a, b)
-            if a.score ~= b.score then return a.score < b.score end
-            return a.rawCost < b.rawCost
-        end)
-
-        local limit = 16
-        local attached = 0
-        local used = {}
-
-        -- Critical invariant:
-        -- query-node attachment must stay cost-driven. Hard walk-distance
-        -- gates can hide valid portal/taxi routes from the pathfinder and
-        -- force cross-continent fallback even when a faster transport path
-        -- exists. We still cap the number of local attachments for graph
-        -- size, but candidate eligibility is determined by score/cost only.
-        for _, c in ipairs(sameMap) do
-            if attached >= limit then break end
-
-            if c.rawCost <= 2200 and not used[c.id] then
-                connectBidirectional(queryId, c.id, c.rawCost, "walk", outwardLabel)
-                used[c.id] = true
-                attached = attached + 1
-            end
-        end
-
-        if attached == 0 then
-            table.sort(sameMap, function(a, b)
-                return a.rawCost < b.rawCost
-            end)
-            for i = 1, math.min(12, #sameMap) do
-                local c = sameMap[i]
-                if c and not used[c.id] then
-                    connectBidirectional(queryId, c.id, c.rawCost, "walk", outwardLabel)
-                    used[c.id] = true
-                    attached = attached + 1
-                end
-            end
-        end
-
-        return attached
-    end
-
-    local startId = addQueryNode(startPoint, "start", "start")
-    local goalId = addQueryNode(destPoint, "goal", "goal")
-
-    attachQueryNode(startId, startPoint.maI, nodes[startId].continent, "walk-to-node")
-    attachQueryNode(goalId, destPoint.maI, nodes[goalId].continent, "node-to-goal")
-
-    local path, cameEdge, totalCost, explored = FindBestPathWithOptionalLearnedPrefix(nodes, startId, goalId, startPoint, baseCount)
-    if not path then
-        return nil, format("no-path explored=%d", explored or -1)
-    end
-
-    local route = {
-        totalCost = totalCost,
-        explored = explored,
-        transportUsed = false,
-        points = {},
-    }
-
-    local map = GetMap()
-    for idx = 1, #path do
-        local nodeId = path[idx]
-        local n = nodes[nodeId]
-        local edge = idx > 1 and cameEdge[nodeId] or nil
-        if edge and IsRealTransportType(edge.type) then
-            route.transportUsed = true
-        end
-        local zx, zy = map:GZP(n.maI, n.wx, n.wy)
-        tinsert(route.points, {
-            maI = n.maI,
-            wx = n.wx,
-            wy = n.wy,
-            zx = zx,
-            zy = zy,
-            mapName = map.ITN and map:ITN(n.maI) or ("Map " .. tostring(n.maI)),
-            edgeType = edge and edge.type or "start",
-            transportKind = edge and (edge.routeTransportKind or edge.type) or nil,
-            label = edge and edge.label or n.label or n.type,
-            cost = edge and edge.cost or 0,
-        })
-    end
-
-    if STATE.db and STATE.db.simplifyTransitWaypoints then
-        route.points = CollapseMinimalTransitNoise(CollapseDeepTaxiChains(route.points))
-    else
-        route.points = CollapseDeepTaxiChains(route.points)
-    end
-
-    return route
-end
-
-local function BuildDirectFallbackLeg(startPoint, destPoint, why, crossContinent)
-    local directCost = WalkCostSeconds(startPoint.wx, startPoint.wy, destPoint.wx, destPoint.wy)
-    dbg("using explicit fallback target: " .. tostring(why))
-    return {
-        totalCost = directCost,
-        explored = 1,
-        fallbackDirect = true,
-        points = {
-            {
-                maI = startPoint.maI,
-                wx = startPoint.wx,
-                wy = startPoint.wy,
-                zx = startPoint.zx,
-                zy = startPoint.zy,
-                mapName = startPoint.mapName,
-                edgeType = "start",
-                label = "Start",
-                cost = 0,
-            },
-            {
-                maI = destPoint.maI,
-                wx = destPoint.wx,
-                wy = destPoint.wy,
-                zx = destPoint.zx,
-                zy = destPoint.zy,
-                mapName = destPoint.mapName,
-                edgeType = crossContinent and "fallback" or "walk",
-                label = crossContinent and "Cross-continent fallback" or "Direct destination",
-                cost = directCost,
-                forceStraight = true,
-            }
-        },
-    }
-end
-
-
 
 function ResolveMapIdByName(name)
     local map = GetMap()
@@ -7300,258 +7592,32 @@ function BuildSouthKalimdorFallbackLeg(startPoint, destPoint, why)
     }
 end
 
-local function BuildRouteLeg(startPoint, destPoint)
-    if not startPoint or not destPoint then
-        return nil, "missing-leg-endpoint"
-    end
-
-    local map = GetMap()
-    if not map then return nil, "no-map" end
-
-    local directCost = WalkCostSeconds(startPoint.wx, startPoint.wy, destPoint.wx, destPoint.wy)
-    if IsPlayerOnTaxi() and destPoint and destPoint.cwTaxiInjected then
-        local directTaxiCost = WalkCostSeconds(startPoint.wx, startPoint.wy, destPoint.wx, destPoint.wy)
-        return {
-            totalCost = directTaxiCost,
-            explored = 1,
-            fallbackDirect = true,
-            activeTaxiLeg = true,
-            points = {
-                {
-                    maI = startPoint.maI,
-                    wx = startPoint.wx,
-                    wy = startPoint.wy,
-                    zx = startPoint.zx,
-                    zy = startPoint.zy,
-                    mapName = startPoint.mapName,
-                    edgeType = "start",
-                    label = "Start",
-                    cost = 0,
-                },
-                {
-                    maI = destPoint.maI,
-                    wx = destPoint.wx,
-                    wy = destPoint.wy,
-                    zx = destPoint.zx,
-                    zy = destPoint.zy,
-                    mapName = destPoint.mapName,
-                    edgeType = "flight_master",
-                    transportKind = "flight_master",
-                    label = destPoint.userName or destPoint.mapName or "Taxi destination",
-                    cost = directTaxiCost,
-                    forceStraight = true,
-                }
-            },
-        }
-    end
-
-    local directLeg = {
-        totalCost = directCost,
-        explored = 1,
-        fallbackDirect = startPoint.maI ~= destPoint.maI,
-        points = {
-            {
-                maI = startPoint.maI,
-                wx = startPoint.wx,
-                wy = startPoint.wy,
-                zx = startPoint.zx,
-                zy = startPoint.zy,
-                mapName = startPoint.mapName,
-                edgeType = "start",
-                label = "Start",
-                cost = 0,
-            },
-            {
-                maI = destPoint.maI,
-                wx = destPoint.wx,
-                wy = destPoint.wy,
-                zx = destPoint.zx,
-                zy = destPoint.zy,
-                mapName = destPoint.mapName,
-                edgeType = "walk",
-                label = startPoint.maI ~= destPoint.maI and "Direct destination" or "Walk",
-                cost = directCost,
-                forceStraight = startPoint.maI ~= destPoint.maI,
-            }
-        },
-    }
-
-    if STATE.db and STATE.db.useIntercontinentalRouting then
-        local route, why = BuildTransportLeg(startPoint, destPoint)
-        if route then
-            -- Same-map legs must still be allowed to use FM/transport when cheaper.
-            if startPoint.maI == destPoint.maI then
-                local routeCost = tonumber(route.totalCost) or huge
-                if route.transportUsed and routeCost <= directCost + 10 then
-                    return route
-                end
-                return directLeg
-            end
-
-            return route
-        end
-
-        local startCont = startPoint.continent or nil
-        local destCont = destPoint.continent or nil
-        local crossContinent = startCont and destCont and startCont ~= destCont
-
-        if crossContinent then
-            return BuildDirectFallbackLeg(startPoint, destPoint, why, true)
-        end
-
-        local forcedSouthKalimdor = BuildSouthKalimdorFallbackLeg(startPoint, destPoint, why)
-        if forcedSouthKalimdor then
-            return forcedSouthKalimdor
-        end
-
-        if STATE.db and not STATE.db.simplifyTransitWaypoints then
-            dbg("deep graph fallback to direct destination: " .. tostring(why))
-        else
-            dbg("graph leg fallback to direct walk: " .. tostring(why))
-        end
-    end
-
-    return directLeg
-end
-
-local function BuildExpandedRoute()
-    local map = GetMap()
-    if not map then return nil, "no-map" end
-
-    if #STATE.db.destinations == 0 then
-        STATE.expandedRoute = nil
-        return {points = {}, summary = "empty"}
-    end
-
-    local current = GetRouteBuildStartPoint()
-    if not current then return nil, "no-player-pos" end
-
-    local route = {
-        totalCost = 0,
-        explored = 0,
-        points = {},
-    }
-
-    for q = 1, #STATE.db.destinations do
-        local dest = STATE.db.destinations[q]
-        local leg, why = BuildRouteLeg(current, dest)
-        if not leg then
-            return nil, format("leg %d failed: %s", q, tostring(why))
-        end
-
-        route.totalCost = route.totalCost + (leg.totalCost or 0)
-        route.explored = route.explored + (leg.explored or 0)
-
-        for i, pt in ipairs(leg.points or {}) do
-            local skipStart = (q > 1 and i == 1)
-            local skipSyntheticStart = (q == 1 and i == 1 and current and current.isSyntheticStart)
-
-            if not skipStart and not skipSyntheticStart then
-                local copy = {}
-                for k, v in pairs(pt) do
-                    copy[k] = v
-                end
-
-                if i == #leg.points then
-                    copy.isQueueStop = true
-                    copy.queueIndex = q
-
-                    -- Preserve user-facing metadata from the original queue destination
-                    -- so Carbonite hover/sync labels can prefer the custom label instead of
-                    -- falling back to edge-type text like "Walk".
-                    copy.userLabel = dest.userLabel or copy.userLabel
-                    copy.userName = dest.userName or copy.userName
-                    copy.description = dest.description or copy.description
-                    copy.label = dest.userLabel or dest.userName or dest.label or copy.label
-                end
-
-                tinsert(route.points, copy)
-            end
-        end
-
-        current = dest
-    end
-
-    STATE.expandedRoute = route
-    return route
-end
-
-local function IsSyncAnchorPoint(routePoints, idx)
-    local pt = routePoints[idx]
-    if not pt or pt.edgeType == "start" then return false end
-
-    local nextPt = routePoints[idx + 1]
-
-    if idx == #routePoints then return true end
-    if pt.isQueueStop then return true end
-    if pt.forceStraight then return true end
-
-    if IsTransitEdgeType(pt.edgeType) then return true end
-    if nextPt and IsTransitEdgeType(nextPt.edgeType) then return true end
-
-    return false
-end
-
-local function ShouldKeepRoutePointForSync(routePoints, idx)
-    local pt = routePoints[idx]
-    if not pt or pt.edgeType == "start" or pt.isSyntheticStart then return false end
-
-    local prev = routePoints[idx - 1]
-    local nextPt = routePoints[idx + 1]
-
-    if not STATE.db or not STATE.db.simplifyTransitWaypoints then
-        return true
-    end
-
-    return IsSyncAnchorPoint(routePoints, idx)
-end
-
-local function CollapseConsecutiveSyncPoints(points)
-    local out = {}
-    for _, pt in ipairs(points or {}) do
-        local prev = out[#out]
-        local keep = true
-        if prev and prev.maI == pt.maI then
-            local d = Dist(prev.wx or 0, prev.wy or 0, pt.wx or 0, pt.wy or 0)
-            if d < 3 then
-                keep = false
-            elseif prev.edgeType == pt.edgeType and d < 2 then
-                keep = false
-            end
-        end
-        if keep then
-            out[#out + 1] = pt
-        end
-    end
-    return out
-end
-
-local function BuildSyncPoints(routePoints)
-    local out = {}
-    for i = 1, #(routePoints or {}) do
-        if ShouldKeepRoutePointForSync(routePoints, i) then
-            out[#out + 1] = routePoints[i]
-        end
-    end
-
-    out = CollapseConsecutiveSyncPoints(out)
-
-    if STATE.db then
-        local skip = tonumber(STATE.deepSyncSkipCount) or 0
-        while skip > 0 and #out > 0 do
-            tremove(out, 1)
-            skip = skip - 1
-        end
-    end
-
-    return out
-end
-
-SyncQueueToCarbonite = function()
+SyncQueueToCarbonite = function(skipIfUnchanged)
     local map = GetMap()
     if not map then
         pr("sync failed: Carbonite map not ready")
         return false
+    end
+
+    local function BuildSyncSignature(points)
+        local parts = {}
+        for i, pt in ipairs(points or {}) do
+            parts[#parts + 1] = table.concat({
+                tostring(i),
+                tostring(pt.maI or ""),
+                tostring(pt.wx or ""),
+                tostring(pt.wy or ""),
+                tostring(pt.edgeType or ""),
+                tostring(BuildSyncLabel(i, pt) or ""),
+                tostring(GetTargetTypeForRoutePoint(pt) or ""),
+            }, "|")
+        end
+        return table.concat(parts, "||")
+    end
+
+    local previousSignature = nil
+    if skipIfUnchanged then
+        previousSignature = tostring(STATE.lastCarboniteSyncSignature or "")
     end
 
     local route, why = BuildExpandedRoute()
@@ -7560,10 +7626,16 @@ SyncQueueToCarbonite = function()
         return false
     end
 
+    local syncPoints = BuildSyncPoints(route.points or {})
+    local newSignature = BuildSyncSignature(syncPoints)
+    if skipIfUnchanged and previousSignature == newSignature then
+        dbg("sync skipped: unchanged route")
+        return true
+    end
+
     InstallCarboniteTravelHook()
     ClearCarboniteTargets(map)
 
-    local syncPoints = BuildSyncPoints(route.points or {})
     local synced = 0
     STATE.syncing = true
     for i, pt in ipairs(syncPoints) do
@@ -7580,6 +7652,7 @@ SyncQueueToCarbonite = function()
     end
     STATE.syncing = false
     STATE.suppressClearUntil = (GetTime() or 0) + 0.75
+    STATE.lastCarboniteSyncSignature = newSignature
 
     if synced == 0 then
         dbg("sync skipped: no route points")
@@ -8605,7 +8678,7 @@ TryPendingLoginQueueSync = function()
     dbg("login: auto-synced non-empty queue to Carbonite")
 end
 
-local function OnEvent(_, event)
+function OnEvent(_, event)
     if event == "PLAYER_LOGIN" then
         EnsureDb()
         CW.CleanupTransientTaxiDestinations(true)
@@ -8703,7 +8776,7 @@ local function OnEvent(_, event)
     end
 end
 
-local function OnUpdate(_, elapsed)
+function OnUpdate(_, elapsed)
     EnsureCarboniteMapButtons()
     TryPendingLoginQueueSync()
     PulseTransportDiscovery(elapsed)
@@ -8800,21 +8873,20 @@ local function OnUpdate(_, elapsed)
     end
 end
 
-local frame = CreateFrame("Frame")
-STATE.frame = frame
-frame:RegisterEvent("PLAYER_LOGIN")
-frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-frame:RegisterEvent("ZONE_CHANGED")
-frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
-frame:RegisterEvent("ZONE_CHANGED_INDOORS")
-frame:RegisterEvent("TAXIMAP_OPENED")
-frame:RegisterEvent("PLAYER_DEAD")
-frame:RegisterEvent("PLAYER_ALIVE")
-frame:RegisterEvent("PLAYER_UNGHOST")
-frame:RegisterEvent("PLAYER_REGEN_DISABLED")
-frame:RegisterEvent("PLAYER_REGEN_ENABLED")
-frame:SetScript("OnEvent", OnEvent)
-frame:SetScript("OnUpdate", OnUpdate)
+STATE.frame = CreateFrame("Frame")
+STATE.frame:RegisterEvent("PLAYER_LOGIN")
+STATE.frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+STATE.frame:RegisterEvent("ZONE_CHANGED")
+STATE.frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+STATE.frame:RegisterEvent("ZONE_CHANGED_INDOORS")
+STATE.frame:RegisterEvent("TAXIMAP_OPENED")
+STATE.frame:RegisterEvent("PLAYER_DEAD")
+STATE.frame:RegisterEvent("PLAYER_ALIVE")
+STATE.frame:RegisterEvent("PLAYER_UNGHOST")
+STATE.frame:RegisterEvent("PLAYER_REGEN_DISABLED")
+STATE.frame:RegisterEvent("PLAYER_REGEN_ENABLED")
+STATE.frame:SetScript("OnEvent", OnEvent)
+STATE.frame:SetScript("OnUpdate", OnUpdate)
 
 SLASH_CUSTOMWAYPOINTS1 = "/cw"
 SlashCmdList.CUSTOMWAYPOINTS = SlashHandler
