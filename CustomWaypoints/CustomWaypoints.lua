@@ -3353,26 +3353,6 @@ ParseExportLine = function(line)
     }
 end
 
-local function ParseRoutePointsBlock(text)
-    local parsed = {}
-    local bad = 0
-    for _, line in ipairs(SplitLines(text or "")) do
-        local dest, why = ParseExportLine(line)
-        if dest then
-            parsed[#parsed + 1] = dest
-        elseif why and why ~= "empty" and why ~= "marker" then
-            bad = bad + 1
-        end
-    end
-    table.sort(parsed, function(a, b)
-        return (a._importOrder or 0) < (b._importOrder or 0)
-    end)
-    for _, dest in ipairs(parsed) do
-        dest._importOrder = nil
-    end
-    return parsed, bad
-end
-
 local function BuildKnownLocationExportHeader(loc)
     return table.concat({
         "CWKNOWN",
@@ -4811,6 +4791,119 @@ ShowWaypointImportPopup = function()
     ArmKeyboardModalFrame(f)
 end
 
+ShowKnownLocationExportPopup = function(textBlob)
+    local frameName = "CustomWaypointsKnownLocationsExportPopup"
+
+    if STATE.knownLocationExportPopup and STATE.knownLocationExportPopup.frame then
+        STATE.knownLocationExportPopup.frame:Hide()
+    end
+
+    local f = CreateFrame("Frame", frameName, UIParent)
+    f:SetWidth(560)
+    f:SetHeight(360)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(96)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:SetScript("OnKeyDown", function(self, key)
+        if key == "ESCAPE" then
+            self:Hide()
+        end
+    end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.92)
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -12)
+    title:SetText("Export known locations")
+
+    local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -34)
+    subtitle:SetWidth(520)
+    subtitle:SetJustifyH("LEFT")
+    subtitle:SetText("Copy the full block from here. This export is shown only in this popup and is not written to the CW chat log.")
+
+    local scroll = CreateFrame("ScrollFrame", frameName .. "Scroll", f, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -62)
+    scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -30, 48)
+
+    local editor = CreateFrame("EditBox", nil, scroll)
+    editor:SetMultiLine(true)
+    editor:SetAutoFocus(false)
+    editor:SetFontObject(GameFontHighlightSmall)
+    editor:SetWidth(490)
+    editor:SetTextInsets(4, 4, 4, 4)
+    editor:SetJustifyH("LEFT")
+    editor:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    editor:SetScript("OnTextChanged", function(self)
+        local content = self:GetText() or ""
+        local _, lineCount = string.gsub(content, "\n", "")
+        local lines = lineCount + 1
+        local _, fontHeight = self:GetFont()
+        fontHeight = fontHeight or 14
+        self:SetHeight(math.max(220, lines * fontHeight + fontHeight * 2))
+        if scroll.UpdateScrollChildRect then
+            scroll:UpdateScrollChildRect()
+        end
+    end)
+    scroll:SetScrollChild(editor)
+    editor:SetText(textBlob or "")
+    editor:GetScript("OnTextChanged")(editor)
+    if editor.HighlightText then
+        editor:HighlightText()
+    end
+
+    local selectAllBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    selectAllBtn:SetWidth(90)
+    selectAllBtn:SetHeight(24)
+    selectAllBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 18, 16)
+    selectAllBtn:SetText("Select all")
+    selectAllBtn:SetScript("OnClick", function()
+        if editor.SetFocus then editor:SetFocus() end
+        if editor.HighlightText then editor:HighlightText() end
+    end)
+
+    local closeBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    closeBtn:SetWidth(90)
+    closeBtn:SetHeight(24)
+    closeBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -18, 16)
+    closeBtn:SetText("Close")
+    closeBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    close:SetScript("OnClick", function() f:Hide() end)
+
+    f:SetScript("OnHide", function(self)
+        if editor and editor.ClearFocus then editor:ClearFocus() end
+        if editor and editor.Hide then editor:Hide() end
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
+    end)
+
+    ArmKeyboardModalFrame(f)
+    STATE.knownLocationExportPopup = { frame = f, editor = editor }
+    f:Show()
+    if editor.SetFocus then editor:SetFocus() end
+    if editor.HighlightText then editor:HighlightText() end
+    ArmKeyboardModalFrame(f)
+end
+
 ShowKnownLocationImportPopup = function()
     local frameName = "CustomWaypointsKnownLocationsImportPopup"
 
@@ -5137,17 +5230,8 @@ ExportKnownLocations = function()
     end
 
     lines[#lines + 1] = "----- COPY KNOWN LOCATIONS TO HERE -----"
-
     local blob = table.concat(lines, "\n")
-    local displayBlob = EscapeForDisplay(blob)
-
-    AppendUiLogLine(displayBlob)
-    pr(lines[1])
-    for i = 2, #lines - 1 do
-        pr(lines[i])
-    end
-    pr(lines[#lines])
-    pr(format("known locations export: %d known location(s), %d transport(s)", #known, #learned))
+    ShowKnownLocationExportPopup(blob)
 end
 
 local function RestoreKnownLocationsSelectionAfterDelete(previousIndex)
@@ -8582,11 +8666,6 @@ local function ExportWaypoints()
     lines[#lines + 1] = "----- COPY TO HERE -----"
     local blob = table.concat(lines, "\n")
     AppendUiLogLine(blob)
-    pr(lines[1])
-    for i = 2, #lines - 1 do
-        pr(lines[i])
-    end
-    pr(lines[#lines])
     pr(format("export: %d waypoint(s) in block (%d data lines). Select all in CW log, copy, paste into Import.", n, n))
 end
 
