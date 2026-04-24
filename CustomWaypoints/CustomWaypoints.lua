@@ -6865,6 +6865,17 @@ local function EnsureUi()
     saveRouteBtn:SetText("Save Route")
     saveRouteBtn:SetScript("OnClick", function() SaveQueueAsKnownRoute() end)
 
+    local searchBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    searchBtn:SetWidth(78)
+    searchBtn:SetHeight(22)
+    searchBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 574, -98)
+    searchBtn:SetText("Search")
+    searchBtn:SetScript("OnClick", function()
+        if CW.ShowDestinationSearchFrame then
+            CW.ShowDestinationSearchFrame("")
+        end
+    end)
+
     local function MakeCheckbox(textLabel, x, y, onClick)
         local cb = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
         cb:SetPoint("TOPLEFT", f, "TOPLEFT", x, y)
@@ -6896,7 +6907,7 @@ local function EnsureUi()
     commands:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -142)
     commands:SetWidth(720)
     commands:SetJustifyH("LEFT")
-    commands:SetText("\n/cw help | ui | tuning | options | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | autodiscovery | transportconfirmation | knownlocations | routeknown <index> | saveroute | savehere")
+    commands:SetText("\n/cw help | ui | tuning | options | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | hasflying | flightmasters | deep | minimal | debug | simplify | legend | transports | cleartransports | transportlog | autodiscovery | transportconfirmation | knownlocations | routeknown <index> | saveroute | savehere | search")
 
     local scroll = CreateFrame("ScrollFrame", "CustomWaypointsScrollFrame", f, "UIPanelScrollFrameTemplate")
     scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -250)
@@ -10059,7 +10070,7 @@ function CW.FormatDestinationSearchCandidate(candidate)
     if dest.zx and dest.zy then
         loc = format("%s %.1f %.1f", loc, dest.zx or -1, dest.zy or -1)
     end
-    return format("%s [%s/%s] → %s",
+    return format("%s [%s/%s] -> %s",
         tostring(candidate.name or "?"),
         tostring(candidate.sourceType or "?"),
         tostring(candidate.kind or "?"),
@@ -10075,7 +10086,7 @@ function CW.PrintDestinationSearchAmbiguity(query, candidates)
     if #candidates > limit then
         parts[#parts + 1] = "+" .. tostring(#candidates - limit) .. " more"
     end
-    pr("destination match ambiguous: " .. tostring(query) .. " → " .. table.concat(parts, "; "))
+    pr("destination match ambiguous: " .. tostring(query) .. " -> " .. table.concat(parts, "; "))
 end
 
 function CW.CollectKnownDestinationSearchCandidates(candidates, query)
@@ -10349,8 +10360,397 @@ function CW.RouteToDestinationSearchCandidate(candidate, query)
         pr(format("routing to destination match: %s", CW.FormatDestinationSearchCandidate(candidate)))
     end
 
+
     return true
 end
+
+function CW.SelectDestinationSearchCandidate(index)
+    local ui = STATE.destinationSearchUi
+    if not ui then return end
+
+    ui.selectedIndex = index
+    CW.RefreshDestinationSearchFrame()
+end
+
+function CW.SetDestinationSearchPage(page)
+    local ui = STATE.destinationSearchUi
+    if not ui then return end
+
+    local candidates = ui.candidates or {}
+    local pageSize = ui.pageSize or 20
+    local maxPage = math.max(1, math.ceil(#candidates / pageSize))
+
+    page = tonumber(page) or 1
+    if page < 1 then page = 1 end
+    if page > maxPage then page = maxPage end
+
+    ui.page = page
+    ui.selectedIndex = nil
+    ui.lastClickKey = nil
+    ui.lastClickTime = nil
+
+    if ui.scroll and ui.scroll.SetVerticalScroll then
+        ui.scroll:SetVerticalScroll(0)
+    end
+
+    CW.RefreshDestinationSearchFrame()
+end
+
+function CW.RefreshDestinationSearchFrame()
+    local ui = STATE.destinationSearchUi
+    if not (ui and ui.content) then return end
+
+    local content = ui.content
+    for _, child in ipairs({content:GetChildren()}) do
+        child:Hide()
+    end
+
+    local candidates = ui.candidates or {}
+    local query = ui.query or ""
+    local pageSize = ui.pageSize or 20
+    ui.pageSize = pageSize
+
+    local total = #candidates
+    local maxPage = math.max(1, math.ceil(total / pageSize))
+    local page = tonumber(ui.page) or 1
+    if page < 1 then page = 1 end
+    if page > maxPage then page = maxPage end
+    ui.page = page
+
+    local startOffset = (page - 1) * pageSize
+    local endOffset = math.min(total, startOffset + pageSize)
+    local startIndex = startOffset + 1
+    local endIndex = endOffset
+
+    if total == 0 then
+        ui.selectedIndex = nil
+    elseif not ui.selectedIndex or not candidates[ui.selectedIndex] or ui.selectedIndex < startIndex or ui.selectedIndex > endIndex then
+        ui.selectedIndex = startIndex
+    end
+
+    if ui.summaryText then
+        if query == "" then
+            ui.summaryText:SetText("Enter a search and press Search. Results include known locations, known routes, Carbonite favorites, and Carbonite guide POIs.")
+        elseif total == 0 then
+            ui.summaryText:SetText("No destination matches for: " .. tostring(query))
+        else
+            ui.summaryText:SetText(format("%d result(s) for: %s  (%d-%d of %d)", total, tostring(query), startOffset, endOffset, total))
+        end
+    end
+
+    if ui.pageText then
+        if total > pageSize then
+            ui.pageText:SetText(format("Page %d/%d", page, maxPage))
+            ui.pageText:Show()
+        else
+            ui.pageText:SetText("")
+            ui.pageText:Hide()
+        end
+    end
+
+    if ui.prevPageBtn then
+        if total > pageSize then
+            ui.prevPageBtn:Show()
+            if page > 1 then ui.prevPageBtn:Enable() else ui.prevPageBtn:Disable() end
+        else
+            ui.prevPageBtn:Hide()
+        end
+    end
+
+    if ui.nextPageBtn then
+        if total > pageSize then
+            ui.nextPageBtn:Show()
+            if page < maxPage then ui.nextPageBtn:Enable() else ui.nextPageBtn:Disable() end
+        else
+            ui.nextPageBtn:Hide()
+        end
+    end
+
+    local yOffset = -8
+    if total == 0 then
+        content:SetHeight(44)
+        return
+    end
+
+    local visibleCount = endIndex - startIndex + 1
+    for candidateIndex = startIndex, endIndex do
+        local idx = candidateIndex
+        local candidate = candidates[idx]
+        local row = CreateFrame("Button", nil, content)
+        row:SetWidth(650)
+        row:SetHeight(48)
+        row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, yOffset)
+        row:RegisterForClicks("LeftButtonUp")
+
+        local bg = row:CreateTexture(nil, "BACKGROUND")
+        bg:SetAllPoints(row)
+        if idx == ui.selectedIndex then
+            bg:SetTexture(0.2, 0.45, 0.9, 0.28)
+        else
+            bg:SetTexture(1, 1, 1, 0.04)
+        end
+
+        local routeCandidate = candidate
+        row:SetScript("OnClick", function()
+            local now = GetTime and GetTime() or 0
+            local uiState = STATE.destinationSearchUi
+            local chosenBeforeRefresh = uiState and uiState.candidates and uiState.candidates[idx] or nil
+            local chosenDest = chosenBeforeRefresh and chosenBeforeRefresh.destination or nil
+            local chosenKey = chosenBeforeRefresh and (
+                tostring(chosenBeforeRefresh.sourceType or "?") .. ":" ..
+                tostring(chosenBeforeRefresh.kind or "?") .. ":" ..
+                tostring(chosenBeforeRefresh.name or "?") .. ":" ..
+                tostring(chosenDest and chosenDest.maI or "?") .. ":" ..
+                tostring(chosenDest and chosenDest.zx or "?") .. ":" ..
+                tostring(chosenDest and chosenDest.zy or "?")
+            ) or nil
+
+            local isDouble =
+                chosenKey
+                and uiState
+                and uiState.lastClickKey == chosenKey
+                and uiState.lastClickTime
+                and (now - uiState.lastClickTime) <= 0.35
+
+            if uiState then
+                uiState.lastClickKey = chosenKey
+                uiState.lastClickTime = now
+            end
+
+            CW.SelectDestinationSearchCandidate(idx)
+
+            if isDouble and chosenBeforeRefresh then
+                if CW.RouteToDestinationSearchCandidate(chosenBeforeRefresh, ui.query) then
+                    if STATE.destinationSearchUi and STATE.destinationSearchUi.frame then
+                        STATE.destinationSearchUi.frame:Hide()
+                    end
+                end
+            end
+        end)
+
+        local title = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        title:SetPoint("TOPLEFT", row, "TOPLEFT", 8, -7)
+        title:SetWidth(500)
+        title:SetJustifyH("LEFT")
+        title:SetText(format("%d) %s", idx, tostring(candidate.name or "?")))
+
+        local meta = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        meta:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
+        meta:SetWidth(510)
+        meta:SetJustifyH("LEFT")
+        meta:SetText(format("score=%s | %s", tostring(candidate.score or "?"), CW.FormatDestinationSearchCandidate(candidate)))
+
+        local routeBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        routeBtn:SetWidth(82)
+        routeBtn:SetHeight(22)
+        routeBtn:SetPoint("RIGHT", row, "RIGHT", -8, 0)
+        routeBtn:SetText("Route")
+        routeBtn:SetScript("OnClick", function()
+            CW.SelectDestinationSearchCandidate(idx)
+            if CW.RouteToDestinationSearchCandidate(routeCandidate, ui.query) then
+                if ui.frame then ui.frame:Hide() end
+            end
+        end)
+
+        yOffset = yOffset - 52
+    end
+
+    content:SetHeight(math.max(44, visibleCount * 52 + 12))
+end
+function CW.SubmitDestinationSearchFrame()
+    local ui = STATE.destinationSearchUi
+    if not ui then return end
+
+    local query = ui.searchBox and ui.searchBox:GetText() or ""
+    query = CW.TrimDestinationSearchText(query)
+    ui.query = query
+    ui.candidates = CW.SearchDestinationKeyword(query)
+    ui.page = 1
+    ui.selectedIndex = nil
+    ui.lastClickKey = nil
+    ui.lastClickTime = nil
+    CW.RefreshDestinationSearchFrame()
+end
+
+function CW.ShowDestinationSearchFrame(initialQuery, initialCandidates)
+    local query = CW.TrimDestinationSearchText(initialQuery or "")
+
+    if STATE.destinationSearchUi and STATE.destinationSearchUi.frame then
+        local ui = STATE.destinationSearchUi
+        ui.query = query
+        ui.candidates = initialCandidates or CW.SearchDestinationKeyword(query)
+        ui.page = 1
+        ui.selectedIndex = nil
+        ui.lastClickKey = nil
+        ui.lastClickTime = nil
+        if ui.searchBox then
+            ui.searchBox:SetText(query)
+        end
+        CW.RefreshDestinationSearchFrame()
+        ArmKeyboardModalFrame(ui.frame)
+        ui.frame:Show()
+        RefreshCwEscOverride()
+        return ui
+    end
+
+    local f = CreateFrame("Frame", "CustomWaypointsDestinationSearchFrame", UIParent)
+    f:SetWidth(720)
+    f:SetHeight(390)
+    f:SetPoint("CENTER", UIParent, "CENTER", 40, -20)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(94)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    if f.EnableKeyboard then f:EnableKeyboard(false) end
+    if f.SetPropagateKeyboardInput then f:SetPropagateKeyboardInput(true) end
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    f:SetScript("OnShow", function(self)
+        PushCwModalFrame(self)
+    end)
+    f:SetScript("OnHide", function(self)
+        RemoveCwModalFrame(self)
+        if STATE.destinationSearchUi and STATE.destinationSearchUi.searchBox then
+            STATE.destinationSearchUi.searchBox:ClearFocus()
+        end
+        if self.SetPropagateKeyboardInput then self:SetPropagateKeyboardInput(true) end
+        if self.EnableKeyboard then self:EnableKeyboard(false) end
+    end)
+    f:SetScript("OnMouseDown", function(self)
+        PushCwModalFrame(self)
+    end)
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0, 0, 0, 0.90)
+
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", f, "TOP", 0, -16)
+    title:SetText("CustomWaypoints - Destination Search")
+
+    local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOP", title, "BOTTOM", 0, -8)
+    subtitle:SetWidth(660)
+    subtitle:SetJustifyH("CENTER")
+    subtitle:SetText("Used for ambiguous /cw <dest> matches. Edit the search, press Search, then Route the desired result.")
+
+    local searchLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    searchLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -64)
+    searchLabel:SetText("Search")
+
+    local searchBox = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+    searchBox:SetAutoFocus(false)
+    searchBox:SetWidth(430)
+    searchBox:SetHeight(20)
+    searchBox:SetPoint("LEFT", searchLabel, "RIGHT", 8, 0)
+    searchBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+        RefreshCwEscOverride()
+    end)
+    searchBox:SetScript("OnEnterPressed", function(self)
+        CW.SubmitDestinationSearchFrame()
+        self:SetFocus()
+        if self.HighlightText then self:HighlightText() end
+        RefreshCwEscOverride()
+    end)
+    searchBox:SetScript("OnEditFocusGained", function()
+        RefreshCwEscOverride()
+    end)
+    searchBox:SetScript("OnEditFocusLost", function(self)
+        if self.HighlightText then self:HighlightText(0, 0) end
+        RefreshCwEscOverride()
+    end)
+
+    local submitBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    submitBtn:SetWidth(82)
+    submitBtn:SetHeight(22)
+    submitBtn:SetPoint("LEFT", searchBox, "RIGHT", 10, 0)
+    submitBtn:SetText("Search")
+    submitBtn:SetScript("OnClick", function()
+        CW.SubmitDestinationSearchFrame()
+    end)
+
+    local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    closeBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local summaryText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    summaryText:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -94)
+    summaryText:SetWidth(430)
+    summaryText:SetJustifyH("LEFT")
+
+    local prevPageBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    prevPageBtn:SetWidth(52)
+    prevPageBtn:SetHeight(20)
+    prevPageBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -190, -90)
+    prevPageBtn:SetText("Prev")
+    prevPageBtn:SetScript("OnClick", function()
+        local ui = STATE.destinationSearchUi
+        CW.SetDestinationSearchPage((ui and ui.page or 1) - 1)
+    end)
+
+    local pageText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    pageText:SetPoint("LEFT", prevPageBtn, "RIGHT", 8, 0)
+    pageText:SetWidth(70)
+    pageText:SetJustifyH("CENTER")
+
+    local nextPageBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    nextPageBtn:SetWidth(52)
+    nextPageBtn:SetHeight(20)
+    nextPageBtn:SetPoint("LEFT", pageText, "RIGHT", 8, 0)
+    nextPageBtn:SetText("Next")
+    nextPageBtn:SetScript("OnClick", function()
+        local ui = STATE.destinationSearchUi
+        CW.SetDestinationSearchPage((ui and ui.page or 1) + 1)
+    end)
+
+    local scroll = CreateFrame("ScrollFrame", "CustomWaypointsDestinationSearchScrollFrame", f, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -120)
+    scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -34, 18)
+
+    local content = CreateFrame("Frame", nil, scroll)
+    content:SetWidth(650)
+    content:SetHeight(44)
+    scroll:SetScrollChild(content)
+
+    STATE.destinationSearchUi = {
+        frame = f,
+        searchBox = searchBox,
+        submitBtn = submitBtn,
+        scroll = scroll,
+        content = content,
+        summaryText = summaryText,
+        prevPageBtn = prevPageBtn,
+        nextPageBtn = nextPageBtn,
+        pageText = pageText,
+        query = query,
+        candidates = initialCandidates or CW.SearchDestinationKeyword(query),
+        page = 1,
+        pageSize = 20,
+        selectedIndex = nil,
+        lastClickKey = nil,
+        lastClickTime = nil,
+    }
+
+    searchBox:SetText(query)
+    CW.RefreshDestinationSearchFrame()
+    ArmKeyboardModalFrame(f)
+    f:Show()
+    RefreshCwEscOverride()
+    return STATE.destinationSearchUi
+end
+
 function CW.TryRouteByDestinationKeyword(query)
     local candidates = CW.SearchDestinationKeyword(query)
     if not candidates or #candidates == 0 then
@@ -10361,6 +10761,9 @@ function CW.TryRouteByDestinationKeyword(query)
     local second = candidates[2]
     if second and (second.score or 0) == (best.score or 0) then
         CW.PrintDestinationSearchAmbiguity(query, candidates)
+        if CW.ShowDestinationSearchFrame then
+            CW.ShowDestinationSearchFrame(query, candidates)
+        end
         return true, "ambiguous"
     end
 
@@ -10379,7 +10782,7 @@ SlashHandler = function(msg)
     msg = string.lower(rawMsg)
 
     if msg == "" or msg == "help" then
-        pr("commands: /cw ui | tuning | options | help | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | autodiscovery | hasflying | flightmasters | deep | minimal | debug | debugfm <name> | simplify | legend | transports | cleartransports | transportlog | transportconfirmation | knownlocations | saveroute | savehere")
+        pr("commands: /cw ui | tuning | options | help | probe | add | list | export | import | sync | route | graph | clear | pop | undo | redo | autosync | autoadvance | autodiscovery | hasflying | flightmasters | deep | minimal | debug | debugfm <name> | simplify | legend | transports | cleartransports | transportlog | transportconfirmation | knownlocations | search | saveroute | savehere")
         return
     elseif msg == "ui" or msg == "panel" or msg == "window" then
         EnsureUi()
@@ -10507,6 +10910,10 @@ SlashHandler = function(msg)
         ShowKnownLocationsFrame()
     elseif msg == "knownlocations" or msg == "known" then
         ShowKnownLocationsFrame()
+    elseif msg == "search" or msg == "find" then
+        if CW.ShowDestinationSearchFrame then
+            CW.ShowDestinationSearchFrame("")
+        end
     elseif msg:match("^routeknown%s+%d+$") then
         local idx = tonumber(msg:match("^routeknown%s+(%d+)$"))
         RouteToKnownLocation(idx)
