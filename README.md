@@ -1,118 +1,338 @@
-# Carbonite 3.3.5a (Remastered) + CustomWaypoints
+<h1 align="center">CustomWaypoints — WoW WotLK Navigator</h1>
+<img src="CustomWaypoints/samples/screenshots/cw_logo.png" width="800" alt="CustomWaypoints logo">
 
-![Multiple waypoints routing through different zones/continents](CustomWaypoints/samples/screenshots/image.png)
+This repository bundles a Wrath-era **Carbonite 3.3.5a** tree with **CustomWaypoints**, a companion addon that adds a modern waypoint workflow, and deep heuristic cross-continent routing.
 
-*Multiple waypoints routing through different zones/continents.*
+CustomWaypoints is a custom GPS addon for players who want faster navigation, route recording, and a practical in-game map knowledge.
 
-This repo bundles a **Wrath-era (3.3.5a)** Carbonite tree with **CustomWaypoints** — a separate addon that layers a waypoint queue and transport-aware routing on top, without editing Carbonite’s own files.
+It was originally built to help players quickly find the best path between locations, avoid getting lost, and move efficiently between useful zones (leveling, gathering, achievements), without relying on external guides.
 
 | Folder | What’s inside |
 |--------|----------------|
-| `Carbonite/` | The map / navigation addon |
-| `CustomWaypoints/` | Queue, routing planner, sync, UI, import/export, transport system — **[start with its README](CustomWaypoints/README.md)** |
-| `CarboniteTransfer/` | Related helpers (warehouse / transfer tooling) |
+| `Carbonite/` | Carbonite map/navigation addon |
+| `CustomWaypoints/` | Waypoint queue, route planning, search UI, known locations, import/export, transport discovery, and Carbonite sync |
+| `CarboniteTransfer/` | Related helper tooling |
+
+For more implementation details, see the [CustomWaypoints README](CustomWaypoints/README.md).
 
 ---
 
-## Trying CustomWaypoints
+## Quick Start
 
-1. Copy repo's folders into `Interface\AddOns\`.
-2. In-game: **`/cw help`** — default capture is **Shift+left-click** on the Carbonite world map.
-> ⚠️ Important: This functionality only works on the character’s current map (via the minimap). Use the world map to navigate between different zones.
-3. Maintenance / “what must not break” lives in **`CustomWaypoints/CHECKPOINT.md`**.
+1. Copy the repo folders into your WoW install under:
+
+   ```text
+   Interface\AddOns\
+   ```
+
+2. Enable **Carbonite** and **CustomWaypoints** from the AddOns screen.
+
+3. In game, run:
+
+   ```text
+   /cw help
+   ```
+
+4. Open the CustomWaypoints UI:
+
+   ```text
+   /cw ui
+   ```
+
+5. Add a waypoint from the Carbonite map with:
+
+   ```text
+   Shift + Left Click
+   ```
 
 ---
+
+## The Mental Model
+
+CustomWaypoints has three main ideas:
+
+### 1. Your current queue
+
+The queue is the list of waypoints you want to visit now.
+
+You can add points from the map, commands, saved locations, saved routes, or Carbonite search data. When auto-sync is enabled, CustomWaypoints pushes the current route into Carbonite so Carbonite can render and guide it.
+
+### 2. Known Locations
+
+Known Locations are reusable saved paths:
+
+- single locations
+- saved routes with multiple waypoints
+- transports / portals / passages
+- flight-master-style links
+- imported route data
+
+Open them with:
+
+```text
+/cw knownlocations
+```
+
+or the keybind:
+
+```text
+Shift + G
+```
+
+### 3. Destination search
+
+If you type something that is not a normal `/cw` command, CustomWaypoints can treat it as a destination search.
+
+For example:
+
+```text
+/cw dalaran
+/cw underbelly
+/cw doras
+/cw mailbox
+/cw valiance keep
+```
+
+It searches across:
+
+- your Known Locations
+- saved routes
+- Carbonite favorites / notes / targets, when available
+- Carbonite Guide POIs such as NPCs, mailboxes, bankers, auctioneers, innkeepers, trainers, and flight masters
+
+If there is one clear best match, it routes immediately. If the match is ambiguous, it opens the Destination Search window so you can choose the exact result.
+
+---
+
+## Useful Commands
+
+### Add coordinates on your current Carbonite map
+
+```text
+/cw <x> <y>
+```
+
+Example:
+
+```text
+/cw 52.4 71.8
+```
+
+This adds a waypoint at those zone coordinates on the current Carbonite map.
+
+### Add coordinates in a named zone
+
+```text
+/cw <zone> <x> <y>
+```
+
+Examples:
+
+```text
+/cw Dalaran 59.6 57.4
+/cw Underbelly 59.6 57.4
+/cw Stormwind 62.1 31.4
+```
+
+CustomWaypoints uses smart zone-name matching against Carbonite map names. It normalizes casing, punctuation, and partial zone names where possible.
+
+If the zone name is ambiguous, the addon will not guess silently. Use a more specific name.
+
+### Search for a destination
+
+```text
+/cw <destination>
+```
+
+Examples:
+
+```text
+/cw doras
+/cw auctioneer
+/cw dalaran innkeeper
+/cw my saved route
+```
+
+If the destination matches a saved route with multiple waypoints, CustomWaypoints loads the full saved route into the queue. You are routed to the start first, then through the rest of the route.
+
+### Open Destination Search directly
+
+```text
+/cw search
+/cw find
+```
+
+The search window lets you:
+
+- browse paginated results
+- double-click a result to route
+- use the `Route` button for the selected result
+
+This is especially useful for broad searches like `mailbox`, `banker`, `flight master`, or zone names with many matches.
+
+---
+
+## Main Workflow
+
+### Add and follow a waypoint
+
+```text
+/cw Dalaran 59.6 57.4
+/cw route
+```
+
+If auto-sync is enabled, Carbonite should receive the route automatically.
+
+### Search and route to a known or Carbonite destination
+
+```text
+/cw doras
+```
+
+If the result is clear, the route is created immediately. If several results are equally plausible, the Destination Search window opens.
+
+### Save your current location
+
+```text
+/cw savehere
+```
+
+or the keybind:
+
+```text
+Shift + G
+```
+
+This opens the save/metadata flow for your current player location.
+This feature is mainly intended for debugging and is best used with microRouting=false, autoAdvance=false, and autoSync=false.
+
+### Save the current queue as a reusable route
+
+```text
+/cw saveroute
+```
+
+Saved routes can later be found from Known Locations or by typing `/cw <route name>`.
+
+### Manage saved data
+
+```text
+/cw knownlocations
+```
+
+Use this window to browse, edit, delete, import, export, and route to saved known locations and routes.
+
+---
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
 |----------|--------|
-| **Shift + Left Click** | Capture waypoint from Carbonite world map |
+| **Shift + Left Click** | Capture waypoint from the Carbonite world map |
 | **Ctrl + Shift + Left Click** | Capture waypoint with metadata |
 | **Ctrl + Right Click** | Fallback waypoint capture |
-| **Ctrl + Shift + Z** | Undo last action (from waypoint queue) |
-| **Ctrl + Shift + Y** | Redo last undone action (from waypoint queue) |
-| **Shift + R** | Save waypoint at current player location and disable auto-advance  -- debug/route-recording feature (Save Here) |
-| **SHIFT + G** | Open Known Locations window |
-| **ESC** | Close most recently opened CustomWaypoints UI frame |
-| **SHIFT-DELETE or CTRL-BACKSPACE** | Delete selected entry (in Known Locations UI) |
+| **Ctrl + Shift + Z** | Undo last queue action |
+| **Ctrl + Shift + Y** | Redo last undone queue action |
+| **Shift + R** | Save waypoint at current player location (`Save Here`) |
+| **Shift + G** | Open Known Locations |
+| **Esc** | Close the most recently opened CustomWaypoints UI frame |
+| **Shift + Delete** | Delete selected entry in Known Locations |
 
-> ⚠️ Note: Some keybinds may not work if overridden by other addons (e.g. Carbonite) or existing WoW bindings.
----
-
-## Key Features
-
-- **Waypoint queue & sync**
-  - Capture custom waypoints from the Carbonite map
-  - Sync queue into Carbonite for rendering / guidance
-  - Auto-advance when reaching current waypoint
-
-- **Transport-aware routing**
-  - Intercontinental routing with portals, boats, zeppelins, trams, and taxis
-  - Learned transports (auto-discovered and reused in future routes)
-  - Duplicate detection and usage tracking for learned routes
-
-- **Transport management system**
-  - In-game UI to view and manage learned transports
-  - Multi-select delete with **keyboard shortcuts (DELETE / ESC)**
-  - Bulk clear and usage visibility
-  - `/cw managetransports` for quick access
-
-- **Transport discovery & confirmation**
-  - Automatic detection of cross-map transports
-  - Optional confirmation dialog before saving
-  - Logging and tracking of discovered routes
-
-- **Routing modes**
-  - **Deep mode**: explicit graph traversal with transport usage
-  - **Minimal mode**: Carbonite-driven routing with simplified anchors
-
-- **Routing tuning (advanced)**
-  - UI for fine-tuning routing preferences (portal, taxi, etc.)
-  - Adjustable walking thresholds and transport prioritization
-  - Changes apply dynamically with optional auto-sync
-
-- **Undo / Redo system**
-  - Full queue history tracking
-  - `/cw undo`, `/cw redo`
-  - Optional keybinds (e.g. Ctrl+Shift+Z / Y)
-
-- **UI & workflow**
-  - Main UI (`/cw ui`) with controls and debug output
-  - Import / export waypoint lists
-  - Interface options panel integration
-  - Lazy UI creation to reduce Carbonite conflicts
+> Some keybinds may not fire if another addon or WoW binding already owns them.
 
 ---
 
-## Routing Modes
+## Feature Overview
 
-### Minimal Mode (Stable)
-- Uses Carbonite routing
+### Waypoint queue and Carbonite sync
 
-### Deep Mode (Experimental)
-- Custom graph-based routing (Dijkstra-style)
-- Uses learned transports and extended graph
-- Some times it can produce stutters
+- Build a queue of one or more waypoints.
+- Sync the queue into Carbonite for display and guidance.
+- Auto-advance when reaching the active destination.
+- Undo/redo queue changes.
 
-> ⚠️ Note: In deep routing, there may be stutters while changing zones if auto route is active. 
+### Destination search
 
-> ⚠️ Note: There may be stuttering when the addon is used alongside Questie.
+- `/cw <dest>` searches for destination `<dest>`.
+- Searches Known Locations, saved routes, Carbonite favorites, and Carbonite Guide POIs.
+- Ambiguous searches open a paginated result window.
 
-> ⚠️ Note: Routes shown while flying with Flight Master may not be reliable. User experience is prioritized at this point.
+### Smart coordinate input
 
-> ⚠️ Note: Routes shown while traversing zones' borders may be broken for few steps.
+- `/cw <x> <y>` adds coordinates on the current map.
+- `/cw <zone> <x> <y>` resolves a named Carbonite zone and adds the point there.
+
+### Known Locations and saved routes
+
+- Save single locations and multi-stop routes.
+- Import/export route data.
+- Route to a saved location or a full saved route.
+- Use the Known Locations UI as the main management surface for saved data.
+
+### Transport-aware routing
+
+- Supports learned transports, portals, boats, zeppelins, trams, taxis, and manually saved route links.
+- Can discover and confirm transport-like transitions during gameplay.
+- Reuses validated map knowledge to improve future routes.
+
+### Routing modes
+
+CustomWaypoints supports two routing styles:
+
+#### Minimal mode
+
+Minimal mode keeps Carbonite in the lead and uses simplified route anchors mainly for cross-continent routing. This is the safest mode for normal use.
+
+```text
+/cw minimal
+```
+
+#### Deep mode
+
+Deep mode uses CustomWaypoints' graph-based routing and transport knowledge more aggressively. It can produce better multi-map routes.
+
+```text
+/cw deep
+```
+
+Use deep mode for richer transport routing. Use minimal mode when you want the most stable everyday behavior.
+
+---
+
+## Important Notes
+
+- Routes shown while flying on a Flight Master may not always reflect the real taxi path.
+- Questie may affect the map when used alongside Carbonite and CustomWaypoints.
+
+---
 
 ## Map Data Collection
-CustomWaypoints isn’t just about routing — it’s also an ongoing effort to build a reliable, community-driven dataset of map knowledge across WotLK.
 
-Many areas in 3.3.5a (especially instances, transports, and edge-case transitions) are incomplete or inconsistent. The goal is to gradually record, validate, and refine real in-game paths and connections through actual gameplay, creating a high-quality routing layer that goes beyond static data.
+CustomWaypoints is also a practical map-data collection project for WotLK 3.3.5a.
 
-Every route, portal, or edge discovered adds value — and this is something that scales best with community input.
+Many useful routes are not represented cleanly by static map data: dungeon entrances, portals, boats, zeppelins, city passages, private-server quirks, and zone transitions often need real in-game validation.
 
-If you’d like to contribute or just explore what’s already been collected, you can check the current dataset here:
+By saving and sharing known routes, players can gradually build a better navigation layer on top of Carbonite.
 
-➡️ [CustomWaypoints/data/known_routes_export.txt](CustomWaypoints/data/known_routes_export.txt)
+Current exported route data can live here:
 
-Even small additions (a dungeon entrance, a working transport, a corrected path) help improve routing for everyone.
+```text
+CustomWaypoints/data/known_routes_export.txt
+```
 
->⚠️ Note: If you import this data in your addon right now, during routing you may get Flight Master paths you have not yet discovered.
+Small additions help: a corrected entrance, a reliable portal, a working transport, or a useful city path can make routing better for everyone.
+
+> If you import shared data, review it first. Some routes may include Flight Master links or transports your character has not discovered.
+
+---
+
+## Developer Notes
+
+Maintenance notes and invariants live in:
+
+```text
+CustomWaypoints/CHECKPOINT.md
+CustomWaypoints/docs/invariants.md
+```
+
+For routing changes, keep the scope small and preserve the distinction between minimal and deep mode. CustomWaypoints should extend Carbonite safely, not replace it wholesale.

@@ -1,10 +1,14 @@
-Sample `/cw route` (debug) output — not the same as `/cw export` waypoint lines; see README **Import/export** for shareable line format.
-
-Sample `/cw route` output
-
-queue=2 carboniteTargets=21 expandedRoute=23 syncPoints=12 totalCost=3360.5 sec explored=172 hasFlyingMount=false simplifyTransit=false useFlightMasters=true
-route 1: maI=2014 (Ironforge) zx=26.6 zy=83.5 wx=3968.838 wy=801.872 edge=start cost=0.0 label=start
-route 2: maI=2014 (Ironforge) zx=72.8 zy=50.2 wx=4041.802 wy=766.810 edge=walk cost=52.9 label=walk-to-node
-route 3: maI=2020 (Stormwind City) zx=66.4 zy=34.1 wx=3670.055 wy=1478.233 edge=tram cost=149.9 label=Tram: Ironforge -> Stormwind City
-route 4: maI=2020 (Stormwind City) zx=18.1 zy=25.8 wx=3502.404 wy=1458.992 edge=walk cost=110.3 label=walk
-...
+CW: queue=1 carboniteTargets=11 expandedRoute=12 syncPoints=11 totalCost=1336.2 sec explored=203 hasFlyingMount=false simplifyTransit=false useFlightMasters=true
+CW: route: 1 queue stop(s), 12 point(s), ~1336s
+CW: route 1: maI=2020 (Stormwind City) zx=60.0 zy=70.8 wx=3647.867 wy=1563.081 edge=start cost=0.0 label=start
+CW: route 2: maI=2020 (Stormwind City) zx=66.4 zy=34.1 wx=3670.055 wy=1478.233 edge=walk cost=57.3 label=walk-to-node
+CW: route 3: maI=2014 (Ironforge) zx=72.8 zy=50.2 wx=4041.802 wy=766.810 edge=tram cost=140.3 label=Tram: Ironforge -> Stormwind City
+CW: route 4: maI=2014 (Ironforge) zx=21.6 zy=77.8 wx=3960.905 wy=795.852 edge=walk cost=56.2 label=walk
+CW: route 5: maI=2007 (Dun Morogh) zx=53.4 zy=35.0 wx=3949.570 wy=805.303 edge=connector cost=9.6 label=Walk connection: Ironforge -> Dun Morogh
+CW: route 6: maI=2007 (Dun Morogh) zx=84.4 zy=31.1 wx=4254.621 wy=779.562 edge=walk cost=200.1 label=walk
+CW: route 7: maI=2015 (Loch Modan) zx=19.2 zy=17.2 wx=4288.836 wy=760.795 edge=connector cost=25.5 label=Walk connection: Loch Modan -> Dun Morogh
+CW: route 8: maI=2015 (Loch Modan) zx=25.6 zy=10.5 wx=4323.811 wy=736.007 edge=walk cost=28.0 label=walk
+CW: route 9: maI=2028 (Wetlands) zx=54.0 zy=70.3 wx=4308.294 wy=617.373 edge=connector cost=78.2 label=Walk connection: Loch Modan -> Wetlands
+CW: route 10: maI=2028 (Wetlands) zx=4.7 zy=57.1 wx=3900.462 wy=544.479 edge=walk cost=270.8 label=walk
+CW: route 11: maI=4006 (Howling Fjord) zx=61.3 zy=62.6 wx=3460.601 wy=-2000.125 edge=boat cost=424.0 label=Boat: Howling Fjord -> Wetlands
+CW: route 12: maI=4006 (Howling Fjord) zx=56.9 zy=57.0 wx=3406.450 wy=-2045.450 edge=walk cost=46.2 label=node-to-goal

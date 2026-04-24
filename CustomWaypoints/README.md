@@ -1,5 +1,8 @@
 ﻿# CustomWaypoints
 
+![Multiple waypoints routing through different zones/continents](samples/screenshots/image.png)
+*Route log: [CustomWaypoints/samples/example-route-logs.txt](CustomWaypoints/samples/example-route-logs.txt)*
+
 Small companion addon for **WoW 3.3.5a** that sits **next to** Carbonite: it doesn’t patch Carbonite files, it just talks to the same map APIs.
 
 **In plain terms:** you click the Carbonite map (with a modifier), you build an ordered list of stops, and CustomWaypoints figures out a route and pushes the important bits back into Carbonite so you still get arrows, lines, and the usual HUD behaviour. Carbonite keeps doing the actual drawing; this addon is the “what should we visit, in what order?” layer.
@@ -14,31 +17,7 @@ Rough breakdown:
 | **Sync** | Writes a **filtered** set of route nodes into Carbonite as targets. |
 | **UI** | Optional window (`/cw ui`), import area, scrolling log, plus a Blizzard **Interface → AddOns** panel. |
 
-If you want the longer technical picture, see [`docs/architecture.md`](docs/architecture.md). For “please don’t break this” maintenance notes, see [`CHECKPOINT.md`](CHECKPOINT.md). The repo-wide engineering doc is [`../CustomWaypoints_Developer_Reference.md`](../CustomWaypoints_Developer_Reference.md).
-
----
-
-## Install
-
-Put folders side by side:
-
-```text
-Interface/AddOns/Carbonite
-Interface/AddOns/CustomWaypoints
-```
-
-Usually Carbonite loads first automatically because it’s a separate addon; if anything’s weird, load order is worth a quick check.
-
----
-
-## Mouse clicks
-
-Defaults (change in saved vars / future options if you customize):
-
-| Input | Effect |
-|--------|--------|
-| **Shift + left-click** on the Carbonite map | Add waypoint (main binding) |
-| **Ctrl + right-click** on the Carbonite map | Add waypoint (alternate binding) |
+If you want the longer technical picture, see [`docs/architecture.md`](docs/architecture.md). For “please don’t break this” maintenance notes, see [`CHECKPOINT.md`](CHECKPOINT.md).
 
 ---
 
@@ -124,10 +103,6 @@ Usually one of these:
 - **`/cw route`** — route length / cost (details need `debug`)  
 - **`/cw probe`** — cursor / map sanity (`debug` for walls of text)
 
-**Heads-up:** fresh installs default to **`debug = true`** in `DEFAULTS`, so you’ll see more noise until you flip it off (slash, UI checkbox, or Interface panel).
-
-With **`debug` on**, **`/cw export`** can also dump the **whole block** through `dbg` to chat — the **log panel** is still the nice place to copy from.
-
 ---
 
 ## Design rules (don’t “fix” these accidentally)
@@ -149,7 +124,6 @@ With **`debug` on**, **`/cw export`** can also dump the **whole block** through 
 | [`CHECKPOINT.md`](CHECKPOINT.md) | What “done” means + regression bullets |
 | [`docs/architecture.md`](docs/architecture.md) | Data flow |
 | [`docs/routing-notes.md`](docs/routing-notes.md) | Policy / transport notes |
-| [`docs/known-issues.md`](docs/known-issues.md) | Honest limitations |
 | [`docs/test-cases.md`](docs/test-cases.md) | Manual QA list |
 
 ---
@@ -158,29 +132,11 @@ With **`debug` on**, **`/cw export`** can also dump the **whole block** through 
 
 Carbonite’s own license files still apply to Carbonite; this integration layer follows whatever license the remaster repo declares for the fork.
 
-
-## ⚠️ Deep Routing Status (Work in Progress)
-
-Deep routing is currently under active development and **not yet fully reliable**.
-
-While it enables advanced pathfinding across:
-- portals
-- transports (boats, zeppelins, trams)
-- flight masters
-- intercontinental routes
-
-it may still:
-- miss valid optimal routes
-- behave inconsistently depending on discovered nodes or FM nodes
-
 ### Recommendation
 For stable behavior and to avoid small lags:
 - use **minimal routing mode** (Carbonite-driven)
 
 Use deep routing only for:
-- smart experimental routing / path validation
-- data gathering
-- contributing feedback / debugging
 - If you are willing to sacrifice performance for precision
 
 ### Notes
