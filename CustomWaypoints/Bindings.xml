@@ -1,4 +1,4 @@
-﻿<Bindings>
+<Bindings>
     <Binding name="CW_TOGGLE_KNOWN_LOCATIONS" header="CUSTOMWAYPOINTS">
         if CustomWaypoints_ToggleKnownLocations then
             CustomWaypoints_ToggleKnownLocations()
@@ -7,6 +7,21 @@
     <Binding name="CW_SAVE_HERE" header="CUSTOMWAYPOINTS">
         if CustomWaypoints_SaveHere then
             CustomWaypoints_SaveHere()
+        end
+    </Binding>
+    <Binding name="CW_CLEAR_QUEUE" header="CUSTOMWAYPOINTS">
+        if CustomWaypoints_ClearQueue then
+            CustomWaypoints_ClearQueue()
+        end
+    </Binding>
+    <Binding name="CW_UNDO" header="CUSTOMWAYPOINTS">
+        if CustomWaypoints_Undo then
+            CustomWaypoints_Undo()
+        end
+    </Binding>
+    <Binding name="CW_REDO" header="CUSTOMWAYPOINTS">
+        if CustomWaypoints_Redo then
+            CustomWaypoints_Redo()
         end
     </Binding>
     <Binding name="CW_DELETE_SELECTED_KNOWN_LOCATION" header="CUSTOMWAYPOINTS">

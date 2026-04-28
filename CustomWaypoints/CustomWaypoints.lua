@@ -2647,7 +2647,8 @@ local function BuildTransportLeg(startPoint, destPoint)
        local function attachQueryNode(queryId, preferMapId, preferContinent, outwardLabel)
         local isStart = outwardLabel == "walk-to-node"
         local isGoal = outwardLabel == "node-to-goal"
-        local allowContinentFallback = not isGoal
+        local transportOnlyLeg = CW.DoesLegRequireTransportPath and CW.DoesLegRequireTransportPath(startPoint, destPoint)
+        local allowContinentFallback = (not isGoal) or (not transportOnlyLeg)
         local tuning = GetRoutingTuning()
 
         local function countPortalTaxi(node)
@@ -2694,12 +2695,12 @@ local function BuildTransportLeg(startPoint, destPoint)
             end
         end
 
-        -- Same-continent fallback is only safe for the start side.
-        -- For the goal side, attaching to an arbitrary continent node when the
-        -- destination map has no real graph node creates bogus anchors (for
-        -- example Dalaran -> Underbelly without a learned transport/passsage).
-        -- In that case we want the caller to fall back to a direct destination
-        -- leg instead of inventing a transport-adjacent anchor.
+        -- Same-continent fallback is allowed for normal continent travel so
+        -- arbitrary Outland/Northrend zone targets can attach to the existing
+        -- regional graph after entering through a proven portal/connector path.
+        -- Keep it disabled for transport-only map-layer transitions (for example
+        -- Dalaran -> Underbelly), where an arbitrary parent-zone anchor would
+        -- recreate the fake straight-line/subzone bypass.
         if #sameMap == 0 and preferContinent and allowContinentFallback then
             for id, n in pairs(nodes) do
                 if type(id) == "number"
@@ -2893,39 +2894,69 @@ local function BuildTransportLeg(startPoint, destPoint)
     return route
 end
 
-local function BuildDirectFallbackLeg(startPoint, destPoint, why, crossContinent)
-    local directCost = WalkCostSeconds(startPoint.wx, startPoint.wy, destPoint.wx, destPoint.wy)
-    dbg("using explicit fallback target: " .. tostring(why))
-    return {
-        totalCost = directCost,
-        explored = 1,
-        fallbackDirect = true,
-        points = {
-            {
-                maI = startPoint.maI,
-                wx = startPoint.wx,
-                wy = startPoint.wy,
-                zx = startPoint.zx,
-                zy = startPoint.zy,
-                mapName = startPoint.mapName,
-                edgeType = "start",
-                label = "Start",
-                cost = 0,
-            },
-            {
-                maI = destPoint.maI,
-                wx = destPoint.wx,
-                wy = destPoint.wy,
-                zx = destPoint.zx,
-                zy = destPoint.zy,
-                mapName = destPoint.mapName,
-                edgeType = crossContinent and "fallback" or "walk",
-                label = crossContinent and "Cross-continent fallback" or "Direct destination",
-                cost = directCost,
-                forceStraight = true,
-            }
-        },
+local function BuildOutlandEntryBridgeLeg(startPoint, destPoint, why)
+    local outlandCont = GetMapContinentForMaI(3002)
+    if not outlandCont then return nil end
+
+    local startCont = startPoint and (startPoint.continent or GetMapContinentForMaI(startPoint.maI)) or nil
+    local destCont = destPoint and (destPoint.continent or GetMapContinentForMaI(destPoint.maI)) or nil
+    if not (startCont and destCont and startCont ~= outlandCont and destCont == outlandCont) then
+        return nil
+    end
+
+    -- Hellfire Peninsula side of the Dark Portal. Cross-continent routes to
+    -- arbitrary Outland zones must first prove a route to this real Outland
+    -- entry anchor, then continue through the existing Outland graph. Without
+    -- this bridge, destinations such as Zangarmarsh/Nagrand can miss the
+    -- Hellfire entry edge and fall back to a bogus old-world -> Outland walk.
+    local entryPoint = {
+        maI = 3002,
+        wx = 2815.407,
+        wy = 4049.569,
+        zx = 89.4,
+        zy = 50.2,
+        mapName = "Hellfire Peninsula",
+        continent = outlandCont,
+        userName = "Hellfire Peninsula entry",
+        label = "Hellfire Peninsula entry",
     }
+
+    local firstLeg, firstWhy = BuildTransportLeg(startPoint, entryPoint)
+    if not firstLeg then
+        dbg("outland entry bridge failed before Hellfire: " .. tostring(firstWhy or why))
+        return nil
+    end
+
+    local secondLeg, secondWhy = BuildTransportLeg(entryPoint, destPoint)
+    if not secondLeg then
+        dbg("outland entry bridge failed after Hellfire: " .. tostring(secondWhy or why))
+        return nil
+    end
+
+    local bridged = {
+        totalCost = (tonumber(firstLeg.totalCost) or 0) + (tonumber(secondLeg.totalCost) or 0),
+        explored = (tonumber(firstLeg.explored) or 0) + (tonumber(secondLeg.explored) or 0),
+        transportUsed = firstLeg.transportUsed or secondLeg.transportUsed,
+        outlandEntryBridge = true,
+        points = {},
+    }
+
+    local function appendPoints(points, skipFirst)
+        for i, pt in ipairs(points or {}) do
+            if not (skipFirst and i == 1) then
+                local copy = {}
+                for k, v in pairs(pt) do
+                    copy[k] = v
+                end
+                bridged.points[#bridged.points + 1] = copy
+            end
+        end
+    end
+
+    appendPoints(firstLeg.points, false)
+    appendPoints(secondLeg.points, true)
+    dbg("using Outland entry bridge via Hellfire: " .. tostring(why))
+    return bridged
 end
 
 local function BuildRouteLeg(startPoint, destPoint)
@@ -3036,8 +3067,8 @@ local function BuildRouteLeg(startPoint, destPoint)
             return route
         end
 
-        local startCont = startPoint.continent or nil
-        local destCont = destPoint.continent or nil
+        local startCont = startPoint.continent or GetMapContinentForMaI(startPoint.maI)
+        local destCont = destPoint.continent or GetMapContinentForMaI(destPoint.maI)
         local crossContinent = startCont and destCont and startCont ~= destCont
 
         if requireTransportPath then
@@ -3046,7 +3077,12 @@ local function BuildRouteLeg(startPoint, destPoint)
         end
 
         if crossContinent then
-            return BuildDirectFallbackLeg(startPoint, destPoint, why, true)
+            local viaOutland = BuildOutlandEntryBridgeLeg(startPoint, destPoint, why)
+            if viaOutland then
+                return viaOutland
+            end
+            dbg("blocked unsafe cross-continent direct fallback: " .. tostring(why))
+            return nil, "cross-continent-no-transport-path"
         end
 
         local forcedSouthKalimdor = BuildSouthKalimdorFallbackLeg(startPoint, destPoint, why)
