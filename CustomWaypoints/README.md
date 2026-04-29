@@ -1,7 +1,7 @@
 ﻿# CustomWaypoints
 
 ![Multiple waypoints routing through different zones/continents](samples/screenshots/image.png)
-*Route log: [CustomWaypoints/samples/example-route-logs.txt](CustomWaypoints/samples/example-route-logs.txt)*
+*Route log: [samples/example-route-logs.txt](samples/example-route-logs.txt)*
 
 Small companion addon for **WoW 3.3.5a** that sits **next to** Carbonite: it doesn’t patch Carbonite files, it just talks to the same map APIs.
 
@@ -123,8 +123,8 @@ Usually one of these:
 |------|-------------|
 | [`CHECKPOINT.md`](CHECKPOINT.md) | What “done” means + regression bullets |
 | [`docs/architecture.md`](docs/architecture.md) | Data flow |
-| [`docs/routing-notes.md`](docs/routing-notes.md) | Policy / transport notes |
-| [`docs/test-cases.md`](docs/test-cases.md) | Manual QA list |
+| [`docs/routing_contracts.md`](docs/routing_contracts.md) | Policy / transport notes |
+| [`docs/test_cases.md`](docs/test_cases.md) | Manual QA list |
 
 ---
 

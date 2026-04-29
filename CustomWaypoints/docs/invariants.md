@@ -1,102 +1,100 @@
 # Invariants — CustomWaypoints
 
-These are NON-NEGOTIABLE behaviors.
-If any of these break, the addon is considered broken.
+These are the rules future changes must preserve.
 
----
+## Queue ownership
 
-## 1. Queue Ownership
+- `CustomWaypointsDB.destinations` is the active queue source of truth.
+- Carbonite targets are output/projection only.
+- User Carbonite clear may clear the CW queue.
+- CW internal Carbonite clear during sync must not clear the CW queue.
 
-- The waypoint queue is owned ONLY by CustomWaypoints.
-- Carbonite must NEVER be the source of truth.
-- Carbonite is a rendering/output layer only.
+## Persistence
 
----
+- Durable data lives in `CustomWaypointsDB`.
+- `EnsureDb()` is the only normal startup/defaulting path.
+- Runtime caches must not override saved queue/known-location truth.
 
-## 2. Sync Contract
+## Route invalidation
 
-- Sync pushes a REDUCED route into Carbonite.
-- Carbonite clears must NOT wipe the CW queue during sync.
-- User-initiated clear MUST wipe the queue.
+Any change to these must invalidate route state:
 
----
+- queue,
+- known locations,
+- learned transports,
+- routing mode,
+- flight master setting,
+- routing tuning,
+- faction/transport policy affecting graph eligibility.
 
-## 3. Routing Modes
+Invalidation must clear graph, expanded route, and sync signature unless deliberately scoped.
 
-- Minimal mode:
-  - No unnecessary intermediate walk nodes
-  - Delegates routing to Carbonite
+## Carbonite sync
 
-- Deep mode:
-  - Full explicit route (graph-based)
-  - CW controls path construction
-  - Carbonite must NOT override routing decisions
+- Sync receives route points from CW, not from Carbonite.
+- Sync must use suppression around internal Carbonite clears.
+- Reduced sync points may differ from expanded route points.
+- Failed route rebuild must not leave misleading stale route state.
 
----
+## Routing modes
 
-## 4. Known Locations
+- Deep mode may use graph and explicit route nodes.
+- Minimal mode may collapse transit noise but must not change the semantic destination.
+- Cross-continent direct walk fallback is unsafe by default.
+- Parent/child map-layer transitions require explicit transport or conservative parent fallback.
 
-- Single source of truth for:
-  - instances
-  - transports
-  - saved routes
-- No parallel "transport management" systems allowed
-- Import must MERGE (union), not replace
+## Known locations
 
----
+- Known Locations is the single management UI for routes, transports, and instances.
+- No separate transport-management UI should be reintroduced.
+- Known-location import is merge + dedupe.
+- Waypoint queue import is replace-queue.
+- Flight master transports are bidirectional.
 
-## 5. Transport Discovery
+## Transport records
 
-- Must:
-  - avoid duplicates
-  - avoid spam confirmations
-- “No” decision must suppress repeats
-- Missing map data must NOT block detection
+- Normalize transport kinds before comparison/routing.
+- Reuse existing alias builders and endpoint builders.
+- Single-node transports must preserve destination aliases/hints.
+- Two-point manual transports must preserve from/to endpoint metadata.
 
----
+## Destination identity
 
-## 6. Death Auto Route
+- Do not silently replace a child/subzone destination with its parent unless the fallback is explicitly marked.
+- If a route falls back to parent, preserve child target metadata for debugging.
+- User label/name should survive route expansion and Carbonite sync label generation.
 
-- Must be OPTIONAL (user-controlled)
-- Must NOT trigger instantly (requires delay/retry)
-- Must NOT spam or loop infinitely
-- Must use safe retry mechanism:
-  - pending state
-  - pulse loop
+## UI and input
 
----
+- ESC closes only the most recent CW modal.
+- CW UI must not block WASD during normal play.
+- Delete override is allowed only for known-location selection and only when not typing.
+- Frames should be lazy-created and cleaned from modal stack on hide.
 
-## 7. UI Behavior
+## Transport discovery
 
-- ESC closes most recent CW frame only
-- UI must NOT block player movement (WASD)
-- Frames must not leak or stack incorrectly
+- AutoDiscovery must be optional.
+- No/ESC must suppress repeated prompts.
+- LFG/teleport-like transitions must not be learned as walked transports.
+- Duplicate learned transports must be compacted/touched, not duplicated.
 
----
+## Death autoroute
 
-## 8. Persistence
+- Must be optional.
+- Must only use a remembered instance context.
+- Must use delayed/retried pending state.
+- Must not loop indefinitely.
 
-- SavedVariables = single source of persistence
-- Reload must:
-  - restore queue
-  - restore known locations
-- No hidden in-memory-only state should override saved data
+## Monolithic Lua limits
 
----
+- Avoid new top-level `local function` unless necessary.
+- Prefer `CW.SomeHelper = function` or reuse existing helpers when helper must be top-level.
+- Prefer nested locals inside existing functions for one-off code.
+- Watch both Lua 5.1 main-chunk local limit and function upvalue limits.
 
-## 9. Import/Export
+## Change discipline
 
-- Export format must remain stable
-- Import must:
-  - validate input
-  - fail safely
-- Known Locations import must deduplicate correctly
-
----
-
-## 10. No Hidden Logic
-
-- Routing behavior must be controlled by:
-  - tuning parameters
-  - explicit settings
-- No hidden biases or hardcoded magic numbers
+- Search for existing helpers before adding new helpers.
+- Prefer a small change at the decision point over a parallel subsystem.
+- Add debug evidence for route-policy changes.
+- Update tests/docs for every new routing case.

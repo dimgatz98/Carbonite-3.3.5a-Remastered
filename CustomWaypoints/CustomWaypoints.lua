@@ -17,9 +17,8 @@
 -- NOTES ABOUT THIS PATCH
 --   - safer /cw UI with visible background and extra toggle buttons
 --   - UI is created lazily (only when opened) to reduce Carbonite-side UI risk
---   - deep mode keeps current behavior, but cross-continent graph no-path now
---     falls back to an explicit direct destination target instead of failing
---     the whole rebuild
+--   - deep mode keeps current behavior, but parent/child map layers can fall
+--     back to their parent zone and continue through explicit saved transports
 --   - simplified routing still does not use flight masters
 -- ============================================================================
 
@@ -685,6 +684,28 @@ function CW.ResolveBestMapIdFromTransportAliases(edge)
             return maI
         end
     end
+
+    -- Single-anchor manual transports can point at a child map layer (for
+    -- example Dalaran Underbelly) while their usable approach is the parent
+    -- zone. If aliases only resolve back to the child map, synthesize the
+    -- routeable parent map id from the child map name/world position.
+    if CW.BuildRouteableParentPointForChildDestination and edge.toMaI and edge.toWx and edge.toWy then
+        local parentPoint = CW.BuildRouteableParentPointForChildDestination({
+            maI = edge.toMaI,
+            wx = edge.toWx,
+            wy = edge.toWy,
+            zx = edge.toZx,
+            zy = edge.toZy,
+            mapName = edge.toMapName,
+            zoneText = edge.toZoneText or edge.toZoneName,
+            subZoneText = edge.toSubZoneText,
+            userName = edge.toZoneName or edge.name or edge.label,
+        })
+        if parentPoint and parentPoint.maI and tonumber(parentPoint.maI) ~= transportMaI then
+            return parentPoint.maI
+        end
+    end
+
     return candidates[1]
 end
 
@@ -2142,6 +2163,308 @@ local function GetMapContinentForMaI(maI)
     return nil
 end
 
+function CW.BuildRouteableParentPointForChildDestination(destPoint)
+    if not (destPoint and destPoint.maI and destPoint.wx and destPoint.wy) then return nil end
+
+    local childMaI = tonumber(destPoint.maI)
+    if not childMaI then return nil end
+
+    local map = GetMap()
+    if not map then return nil end
+
+    local childName = CW.GetPointMapNameForRouting(destPoint)
+        or destPoint.mapName
+        or destPoint.subZoneText
+        or destPoint.zoneText
+        or destPoint.userName
+    local childKey = CW.NormalizeZoneLookupKey(childName)
+    if childKey == "" then return nil end
+
+    local function isValidWorldPointOnMap(maI, wx, wy)
+        if not (map and map.GZP and maI and wx and wy) then return false end
+        local ok, zx, zy = pcall(map.GZP, map, maI, wx, wy)
+        return ok and zx and zy and zx >= 0 and zx <= 100 and zy >= 0 and zy <= 100, zx, zy
+    end
+
+    local function getMapNameForMaI(maI)
+        if map and map.ITN and maI then
+            local ok, name = pcall(map.ITN, map, maI)
+            if ok and name and tostring(name) ~= "" then
+                return tostring(name)
+            end
+        end
+        if Nx and Nx.MITN and Nx.MITN[maI] and tostring(Nx.MITN[maI]) ~= "" then
+            return tostring(Nx.MITN[maI])
+        end
+        return nil
+    end
+
+    local candidates, seen = {}, {}
+
+    local function addCandidate(maI, sourceName)
+        maI = tonumber(maI)
+        if not maI or maI == childMaI or seen[maI] then return end
+        local parentCont = GetMapContinentForMaI(maI)
+        if not parentCont then return end
+
+        local parentName = getMapNameForMaI(maI) or sourceName
+        local parentKey = CW.NormalizeZoneLookupKey(parentName)
+        if parentKey == "" or parentKey == childKey then return end
+
+        -- Keep this conservative: only use an actual parent-name prefix match
+        -- and only if the child world coordinate can be projected onto it.
+        if string.find(childKey, parentKey, 1, true) ~= 1 then return end
+
+        local ok, zx, zy = isValidWorldPointOnMap(maI, destPoint.wx, destPoint.wy)
+        if not ok then return end
+
+        seen[maI] = true
+        candidates[#candidates + 1] = {
+            maI = maI,
+            name = parentName,
+            key = parentKey,
+            zx = zx,
+            zy = zy,
+            score = #parentKey,
+        }
+    end
+
+    local function addNamePrefixes(rawName)
+        local key = CW.NormalizeZoneLookupKey(rawName)
+        if key == "" then return end
+
+        local words = {}
+        for word in string.gmatch(key, "%S+") do
+            words[#words + 1] = word
+        end
+
+        if #words < 2 then return end
+
+        for count = #words - 1, 1, -1 do
+            local prefix = table.concat(words, " ", 1, count)
+            local maI = select(1, CW.ResolveMapIdBySmartName(prefix))
+            addCandidate(maI, prefix)
+        end
+    end
+
+    addNamePrefixes(childName)
+    addNamePrefixes(destPoint.mapName)
+    addNamePrefixes(destPoint.subZoneText)
+    addNamePrefixes(destPoint.zoneText)
+    addNamePrefixes(destPoint.userName)
+    addNamePrefixes(destPoint.label)
+
+    -- Carbonite's map-name table is a useful fallback when the child name is
+    -- "Parent Child" but the user-facing saved label is unrelated.
+    if Nx and Nx.MITN then
+        for maI, name in pairs(Nx.MITN) do
+            addCandidate(maI, name)
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        return tostring(a.name or "") < tostring(b.name or "")
+    end)
+
+    local best = candidates[1]
+    if not best then return nil end
+
+    local parentPoint = CloneWorldPoint(destPoint) or {}
+    parentPoint.maI = best.maI
+    parentPoint.mapName = best.name or ("Map " .. tostring(best.maI))
+    parentPoint.zx = best.zx
+    parentPoint.zy = best.zy
+    parentPoint.cwChildZoneFallbackForMaI = childMaI
+    parentPoint.cwChildZoneFallbackForName = childName
+    parentPoint.cwAllowDirectTravel = true
+    parentPoint.userName = destPoint.userName or childName
+    parentPoint.userLabel = destPoint.userLabel
+    parentPoint.label = destPoint.label
+    return parentPoint
+end
+
+local function CopyExplicitTransportEdge(edge)
+    if not edge then return nil end
+    local copy = {}
+    for k, v in pairs(edge) do
+        copy[k] = v
+    end
+    return NormalizeTransportRecord(copy)
+end
+
+local function ExplicitTransportTargetMatches(edge, targetName)
+    local key = CW.NormalizeZoneLookupKey(targetName)
+    if key == "" then return true end
+    if CW.TransportDestinationAliasMatches(edge, targetName) then return true end
+
+    return CW.ZoneLookupKeysMatchLoosely(edge and edge.toMapName, targetName)
+        or CW.ZoneLookupKeysMatchLoosely(edge and edge.toZoneName, targetName)
+        or CW.ZoneLookupKeysMatchLoosely(edge and edge.toZoneText, targetName)
+        or CW.ZoneLookupKeysMatchLoosely(edge and edge.toSubZoneText, targetName)
+end
+
+local function SynthesizeSingleNodeTransportEntry(edge, fromMaI)
+    if not (edge and CW.IsSingleNodeManualTransportEdge(edge) and edge.toMaI and edge.toWx and edge.toWy) then
+        return nil
+    end
+
+    fromMaI = tonumber(fromMaI)
+    if not fromMaI then return nil end
+
+    local aliasMaI = CW.ResolveBestMapIdFromTransportAliases(edge)
+    if tonumber(aliasMaI) ~= fromMaI then
+        return nil
+    end
+
+    local copy = CopyExplicitTransportEdge(edge)
+    if not copy then return nil end
+
+    local parentPoint = nil
+    if CW.BuildRouteableParentPointForChildDestination then
+        parentPoint = CW.BuildRouteableParentPointForChildDestination({
+            maI = copy.toMaI,
+            wx = copy.toWx,
+            wy = copy.toWy,
+            zx = copy.toZx,
+            zy = copy.toZy,
+            mapName = copy.toMapName,
+            zoneText = copy.toZoneText or copy.toZoneName,
+            subZoneText = copy.toSubZoneText,
+            userName = copy.toZoneName or copy.name or copy.label,
+        })
+    end
+
+    copy.fromMaI = fromMaI
+    copy.fromWx = copy.toWx
+    copy.fromWy = copy.toWy
+    copy.fromZx = parentPoint and parentPoint.zx or copy.toZx
+    copy.fromZy = parentPoint and parentPoint.zy or copy.toZy
+    copy.fromMapName = parentPoint and parentPoint.mapName or tostring(fromMaI)
+    copy.fromZoneText = copy.fromMapName
+    copy.fromSubZoneText = nil
+    copy.fromZoneName = copy.fromMapName
+    return NormalizeTransportRecord(copy)
+end
+
+function CW.FindExplicitTransportEdgeBetweenMaps(fromMaI, toMaI, targetName)
+    fromMaI = tonumber(fromMaI)
+    toMaI = tonumber(toMaI)
+    if not fromMaI or not toMaI or fromMaI == toMaI then return nil end
+
+    local function orient(edge)
+        edge = CopyExplicitTransportEdge(edge)
+        if not edge then return nil end
+
+        local edgeFrom = tonumber(edge.fromMaI)
+        local edgeTo = tonumber(edge.toMaI)
+
+        if edgeFrom == fromMaI and edgeTo == toMaI then
+            if ExplicitTransportTargetMatches(edge, targetName) then
+                return edge
+            end
+            return nil
+        end
+
+        if edgeFrom == toMaI and edgeTo == fromMaI and IsBidirectionalTransportRecord(edge) then
+            local reversed = CW.ReverseTransportEdgeDirection(edge)
+            if ExplicitTransportTargetMatches(reversed, targetName) then
+                return reversed
+            end
+            return nil
+        end
+
+        if CW.IsSingleNodeManualTransportEdge(edge) and edgeTo == toMaI then
+            local synthesized = SynthesizeSingleNodeTransportEntry(edge, fromMaI)
+            if synthesized and ExplicitTransportTargetMatches(synthesized, targetName) then
+                return synthesized
+            end
+        end
+
+        return nil
+    end
+
+    for _, edge in ipairs(EnsureTransportDb() or {}) do
+        local oriented = orient(edge)
+        if oriented then return oriented end
+    end
+
+    for _, loc in ipairs(STATE.db and STATE.db.knownLocations or {}) do
+        if loc and tostring(loc.kind or "") == "transport" and CW.BuildManualTransportLikeEdgeFromKnownLocation then
+            local oriented = orient(CW.BuildManualTransportLikeEdgeFromKnownLocation(loc))
+            if oriented then return oriented end
+        end
+    end
+
+    return nil
+end
+
+local function BuildExplicitChildTransportEntryPoint(edge, label)
+    local entry = CW.BuildPointFromTransportEndpoint(edge, "from", label)
+    if not entry then return nil end
+    entry.edgeType = "walk-to-transport"
+    entry.transportKind = nil
+    entry.forceStraight = true
+    entry.userName = entry.userName or label
+    return entry
+end
+
+local function TryAppendExplicitChildTransportAfterParentFallback(parentLeg, parentDest, childDest, explicitEdge)
+    if not (parentLeg and type(parentLeg.points) == "table" and parentDest and childDest) then return false end
+    if not (parentDest.maI and childDest.maI and tonumber(parentDest.maI) ~= tonumber(childDest.maI)) then return false end
+
+    local childName = CW.GetPointMapNameForRouting(childDest)
+        or childDest.mapName
+        or childDest.subZoneText
+        or childDest.zoneText
+        or childDest.userName
+
+    local edge = explicitEdge or CW.FindExplicitTransportEdgeBetweenMaps(parentDest.maI, childDest.maI, childName)
+    if not edge then return false end
+
+    local kind = CanonicalTransportKind(edge.transportKind or "transport")
+    local label = tostring(edge.trackerLabel or edge.label or edge.name or childName or "Child zone transport")
+    local entry = BuildExplicitChildTransportEntryPoint(edge, "Transport entry: " .. label)
+    local exit = CW.BuildPointFromTransportEndpoint(edge, "to", label)
+    if not (entry and exit) then return false end
+
+    local extraCost = 0
+    local current = parentLeg.points[#parentLeg.points]
+
+    if current and not CW.ArePointsNearSameLocation(current, entry) then
+        entry.cost = WalkCostSeconds(current.wx, current.wy, entry.wx, entry.wy)
+        extraCost = extraCost + (entry.cost or 0)
+        parentLeg.points[#parentLeg.points + 1] = entry
+        current = entry
+    end
+
+    exit.edgeType = kind
+    exit.transportKind = kind
+    exit.forceStraight = true
+    exit.cost = TransportCostSeconds(kind, entry.wx, entry.wy, exit.wx, exit.wy)
+    extraCost = extraCost + (exit.cost or 0)
+    parentLeg.points[#parentLeg.points + 1] = exit
+    current = exit
+
+    if not CW.ArePointsNearSameLocation(current, childDest) then
+        local final = CloneWorldPoint(childDest) or {}
+        final.edgeType = "walk"
+        final.transportKind = nil
+        final.label = childDest.userName or childDest.label or childDest.mapName or childName or "Walk"
+        final.cost = WalkCostSeconds(current.wx, current.wy, final.wx, final.wy)
+        final.forceStraight = true
+        extraCost = extraCost + (final.cost or 0)
+        parentLeg.points[#parentLeg.points + 1] = final
+    end
+
+    parentLeg.totalCost = (tonumber(parentLeg.totalCost) or 0) + extraCost
+    parentLeg.explored = (tonumber(parentLeg.explored) or 0) + 1
+    parentLeg.transportUsed = true
+    parentLeg.childZoneExplicitTransport = true
+    parentLeg.effectiveDestination = CloneWorldPoint(childDest) or childDest
+    return true
+end
+
 local function EnsureGraph()
     if STATE.graph then return STATE.graph end
 
@@ -2959,7 +3282,7 @@ local function BuildOutlandEntryBridgeLeg(startPoint, destPoint, why)
     return bridged
 end
 
-local function BuildRouteLeg(startPoint, destPoint)
+local function BuildRouteLeg(startPoint, destPoint, suppressParentFallback)
     if not startPoint or not destPoint then
         return nil, "missing-leg-endpoint"
     end
@@ -3070,6 +3393,53 @@ local function BuildRouteLeg(startPoint, destPoint)
         local startCont = startPoint.continent or GetMapContinentForMaI(startPoint.maI)
         local destCont = destPoint.continent or GetMapContinentForMaI(destPoint.maI)
         local crossContinent = startCont and destCont and startCont ~= destCont
+
+        if not suppressParentFallback
+            and not CW.DoesPointMatchCurrentZoneContextStrict(destPoint)
+            and CW.BuildRouteableParentPointForChildDestination then
+            local parentDest = CW.BuildRouteableParentPointForChildDestination(destPoint)
+            if parentDest then
+                local childName = CW.GetPointMapNameForRouting(destPoint) or destPoint.mapName or destPoint.userName
+                local explicitChildTransport = CW.FindExplicitTransportEdgeBetweenMaps(parentDest.maI, destPoint.maI, childName)
+                local parentRouteDest = parentDest
+
+                if explicitChildTransport then
+                    local entry = BuildExplicitChildTransportEntryPoint(explicitChildTransport, "Transport entry: " .. tostring(explicitChildTransport.label or childName or "child zone"))
+                    if entry then
+                        entry.cwAllowDirectTravel = true
+                        entry.userName = entry.userName or entry.label
+                        parentRouteDest = entry
+                    end
+                end
+
+                local parentLeg, parentWhy = BuildRouteLeg(startPoint, parentRouteDest, true)
+                if parentLeg then
+                    parentLeg.childZoneParentFallback = true
+
+                    if explicitChildTransport and TryAppendExplicitChildTransportAfterParentFallback(parentLeg, parentRouteDest, destPoint, explicitChildTransport) then
+                        dbg("child-zone parent fallback continued through explicit transport: "
+                            .. tostring(childName or destPoint.maI)
+                            .. " via " .. tostring(explicitChildTransport.label or explicitChildTransport.transportKind or "transport"))
+                    else
+                        parentLeg.effectiveDestination = CloneWorldPoint(parentDest) or parentDest
+                        local last = parentLeg.points and parentLeg.points[#parentLeg.points] or nil
+                        if last then
+                            last.cwChildZoneFallbackForMaI = destPoint.maI
+                            last.cwChildZoneFallbackForName = childName
+                            last.label = last.label or ("Parent zone fallback: " .. tostring(parentDest.mapName or parentDest.maI))
+                        end
+                        dbg("child-zone parent fallback: "
+                            .. tostring(childName or destPoint.maI)
+                            .. " -> " .. tostring(parentDest.mapName or parentDest.maI)
+                            .. " after " .. tostring(why))
+                    end
+
+                    return parentLeg
+                end
+
+                dbg("child-zone parent fallback failed: " .. tostring(parentWhy or why))
+            end
+        end
 
         if requireTransportPath then
             dbg("transport-required leg has no transport path: " .. tostring(why))
@@ -9874,7 +10244,7 @@ local function Probe()
     end
 end
 
-local function RouteSummary()
+RouteSummary = function()
     local map = GetMap()
     if not map then
         pr("no Carbonite map")
