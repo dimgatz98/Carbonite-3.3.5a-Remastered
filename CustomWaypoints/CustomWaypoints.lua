@@ -112,7 +112,7 @@ local DEFAULTS = {
 local ROUTING_TUNING_DEFAULTS = {
     -- Preference bonuses (higher = more preferred)
     learnedPortalBonus = 10,
-    portalBonus = 10,
+    portalBonus = 0,
     tramBonus = 80,
     boatBonus = 35,
     zeppelinBonus = 35,
@@ -3449,6 +3449,11 @@ local function BuildRouteLeg(startPoint, destPoint, suppressParentFallback)
             return nil, "transport-required-no-path"
         end
 
+        local forcedSouthKalimdor = BuildSouthKalimdorFallbackLeg(startPoint, destPoint, why)
+        if forcedSouthKalimdor then
+            return forcedSouthKalimdor
+        end
+
         if crossContinent then
             local viaOutland = BuildOutlandEntryBridgeLeg(startPoint, destPoint, why)
             if viaOutland then
@@ -3456,11 +3461,6 @@ local function BuildRouteLeg(startPoint, destPoint, suppressParentFallback)
             end
             dbg("blocked unsafe cross-continent direct fallback: " .. tostring(why))
             return nil, "cross-continent-no-transport-path"
-        end
-
-        local forcedSouthKalimdor = BuildSouthKalimdorFallbackLeg(startPoint, destPoint, why)
-        if forcedSouthKalimdor then
-            return forcedSouthKalimdor
         end
 
         if STATE.db and not STATE.db.simplifyTransitWaypoints then
